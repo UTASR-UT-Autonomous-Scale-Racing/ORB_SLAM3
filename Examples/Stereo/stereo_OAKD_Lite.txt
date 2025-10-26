@@ -1,0 +1,129 @@
+/**
+* This file is part of ORB-SLAM3
+*
+* Copyright (C) 2017-2021 Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, José M.M. Montiel and Juan D. Tardós, University of Zaragoza.
+* Copyright (C) 2014-2016 Raúl Mur-Artal, José M.M. Montiel and Juan D. Tardós, University of Zaragoza.
+*
+* ORB-SLAM3 is free software: you can redistribute it and/or modify it under the terms of the GNU General Public
+* License as published by the Free Software Foundation, either version 3 of the License, or
+* (at your option) any later version.
+*
+* ORB-SLAM3 is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+* the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+* GNU General Public License for more details.
+*
+* You should have received a copy of the GNU General Public License along with ORB-SLAM3.
+* If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <signal.h>
+#include <stdlib.h>
+#include <iostream>
+#include <algorithm>
+#include <condition_variable>
+
+#include <opencv2/core/core.hpp>
+
+#include <depthai/depthai.hpp>
+
+#include <System.h>
+
+using namespace std;
+
+static volatile bool b_continue_session = true;
+
+void exit_loop_handler(int /*s*/){
+    cout << "Finishing session" << endl;
+    b_continue_session = false;
+}
+
+static double tp_to_seconds(const std::chrono::steady_clock::time_point &tp) {
+    return std::chrono::duration_cast<std::chrono::duration<double>>(tp.time_since_epoch()).count();
+}
+
+int main(int argc, char **argv) {
+
+    if (argc < 3 || argc > 4) {
+        cerr << endl
+             << "Usage: ./stereo_oakd_lite path_to_vocabulary path_to_settings (trajectory_file_name)"
+             << endl;
+        return 1;
+    }
+
+    string file_name;
+    if (argc == 4) file_name = string(argv[argc - 1]);
+
+    struct sigaction sigIntHandler;
+    sigIntHandler.sa_handler = exit_loop_handler;
+    sigemptyset(&sigIntHandler.sa_mask);
+    sigIntHandler.sa_flags = 0;
+    sigaction(SIGINT, &sigIntHandler, NULL);
+
+    // Create SLAM system. It initializes all system threads and gets ready to process frames.
+    ORB_SLAM3::System SLAM(argv[1], argv[2], ORB_SLAM3::System::STEREO, true, 0, file_name);
+    float imageScale = SLAM.GetImageScale();
+
+    // Build DepthAI pipeline: two mono cameras -> XLinkOut
+    dai::Pipeline pipeline;
+    auto monoLeft = pipeline.create<dai::node::MonoCamera>();
+    auto monoRight = pipeline.create<dai::node::MonoCamera>();
+    auto xoutLeft = pipeline.create<dai::node::XLinkOut>();
+    auto xoutRight = pipeline.create<dai::node::XLinkOut>();
+
+    monoLeft->setBoardSocket(dai::CameraBoardSocket::LEFT);
+    monoRight->setBoardSocket(dai::CameraBoardSocket::RIGHT);
+    monoLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_480_P);
+    monoRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_480_P);
+
+    xoutLeft->setStreamName("left");
+    xoutRight->setStreamName("right");
+
+    monoLeft->out.link(xoutLeft->input);
+    monoRight->out.link(xoutRight->input);
+
+    dai::Device device(pipeline);
+    auto qLeft = device.getOutputQueue("left", 8, false);
+    auto qRight = device.getOutputQueue("right", 8, false);
+
+    cout << "OAK-D Lite pipeline started\n";
+
+    double timestamp;
+    cv::Mat im, imRight;
+
+    while (!SLAM.isShutDown() && b_continue_session) {
+        // Blocking get for left and right frames
+        auto leftFrame = qLeft->get<dai::ImgFrame>();
+        auto rightFrame = qRight->get<dai::ImgFrame>();
+
+        if (!leftFrame || !rightFrame) {
+            // device disconnected or queue closed
+            break;
+        }
+
+        // Convert to cv::Mat (mono images)
+        im = leftFrame->getCvFrame();
+        imRight = rightFrame->getCvFrame();
+
+        // Use steady_clock timestamps from frames (seconds)
+        timestamp = tp_to_seconds(leftFrame->getTimestamp());
+
+        // If image scale requested by SLAM, resize both
+        if (imageScale != 1.f) {
+            int width = int(im.cols * imageScale);
+            int height = int(im.rows * imageScale);
+            cv::resize(im, im, cv::Size(width, height));
+            cv::resize(imRight, imRight, cv::Size(width, height));
+        }
+
+        // Feed to SLAM (images are mono/grayscale)
+        SLAM.TrackStereo(im, imRight, timestamp);
+    }
+
+    cout << "System shutdown!\n";
+    return 0;
+}
+        SLAM.InsertTrackTime(t_track);
+#endif
+    }
+    cout << "System shutdown!\n";
+}
