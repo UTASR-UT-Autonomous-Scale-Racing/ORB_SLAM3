@@ -26,6 +26,7 @@
 #include<stdlib.h>
 #include<string>
 #include<thread>
+#include<unordered_set>
 #include<opencv2/core/core.hpp>
 
 #include "Tracking.h"
@@ -79,10 +80,24 @@ class Tracking;
 class LocalMapping;
 class LoopClosing;
 class Settings;
+class MapPoint;
+class KeyFrame;
 
 class System
 {
 public:
+    struct TrajectorySample {
+        double timestamp{0.0};
+        Sophus::SE3f pose;
+        std::vector<MapPoint*> newMapPoints;
+        std::vector<cv::KeyPoint> keypoints;
+    };
+
+    struct KeyFrameTrajectorySample {
+        double timestamp{0.0};
+        Sophus::SE3f pose;
+    };
+
     // Input sensor
     enum eSensor{
         MONOCULAR=0,
@@ -157,6 +172,9 @@ public:
 
     void SaveTrajectoryEuRoC(const string &filename, Map* pMap);
     void SaveKeyFrameTrajectoryEuRoC(const string &filename, Map* pMap);
+
+    bool getCurrentTrajectory(TrajectorySample& sample);
+    bool getCurrentKeyFrameTrajectory(KeyFrameTrajectorySample& sample);
 
     // Save data used for initialization debug
     void SaveDebugData(const int &iniIdx);
@@ -254,6 +272,12 @@ private:
     std::vector<MapPoint*> mTrackedMapPoints;
     std::vector<cv::KeyPoint> mTrackedKeyPointsUn;
     std::mutex mMutexState;
+
+    double mLastFrameTimestamp;
+    double mLastPublishedFrameTime;
+    double mLastPublishedKeyFrameTime;
+    KeyFrame* mpLastPublishedKeyFrame;
+    std::unordered_set<long unsigned int> mPublishedMapPointIds;
 
     //
     string mStrLoadAtlasFromFile;
