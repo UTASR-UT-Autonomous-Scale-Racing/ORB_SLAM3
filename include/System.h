@@ -41,6 +41,8 @@
 #include "ImuTypes.h"
 #include "Settings.h"
 
+// Forward declaration for pybind11 wrapper friend access
+class SLAM;
 
 namespace ORB_SLAM3
 {
@@ -116,6 +118,10 @@ public:
 
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    // Grant access to the pybind11 wrapper for map-point / keyframe queries
+    friend class ::SLAM;
+
     // Initialize the SLAM system. It launches the Local Mapping, Loop Closing and Viewer threads.
     System(const string &strVocFile, const string &strSettingsFile, const eSensor sensor, const bool bUseViewer = true, const int initFr = 0, const string &strSequence = std::string());
 
