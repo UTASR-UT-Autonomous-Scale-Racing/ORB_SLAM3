@@ -42,6 +42,36 @@ find_package(Eigen3 3.1.0 REQUIRED)
 find_package(Pangolin REQUIRED)
 find_package(realsense2)
 
+# CUDA ORB extractor (FAST, blur and descriptors on the GPU). Set
+# CMAKE_CUDA_ARCHITECTURES for the target GPU, e.g. 87 for Jetson Orin.
+option(ORB_SLAM3_WITH_CUDA "Build the CUDA ORB extractor if a CUDA compiler is found" ON)
+set(ORB_SLAM3_CUDA_SOURCES "")
+if(ORB_SLAM3_WITH_CUDA)
+   include(CheckLanguage)
+   check_language(CUDA)
+   if(CMAKE_CUDA_COMPILER)
+      if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+         set(CMAKE_CUDA_ARCHITECTURES 89)
+      endif()
+      enable_language(CUDA)
+      find_package(CUDAToolkit REQUIRED)
+      set(CMAKE_CUDA_STANDARD 14)
+      add_definitions(-DORB_SLAM3_WITH_CUDA)
+      # does the host build fuse multiply-adds? The descriptor kernel rounds the same way.
+      include(CheckCXXSourceCompiles)
+      set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE}")
+      check_cxx_source_compiles("#if !(defined(__FMA__) || defined(__aarch64__))\n#error no fma\n#endif\nint main(){return 0;}" ORB_SLAM3_HOST_FMA)
+      unset(CMAKE_REQUIRED_FLAGS)
+      if(ORB_SLAM3_HOST_FMA)
+         add_definitions(-DORB_SLAM3_HOST_FMA)
+      endif()
+      set(ORB_SLAM3_CUDA_SOURCES src/ORBextractorCuda.cu include/ORBextractorCuda.h)
+      message(STATUS "CUDA ORB extractor: ON (architectures ${CMAKE_CUDA_ARCHITECTURES})")
+   else()
+      message(STATUS "CUDA ORB extractor: OFF (no CUDA compiler)")
+   endif()
+endif()
+
 include_directories(
 ${PROJECT_SOURCE_DIR}
 ${PROJECT_SOURCE_DIR}/include
@@ -59,6 +89,7 @@ src/Tracking.cc
 src/LocalMapping.cc
 src/LoopClosing.cc
 src/ORBextractor.cc
+${ORB_SLAM3_CUDA_SOURCES}
 src/ORBmatcher.cc
 src/FrameDrawer.cc
 src/Converter.cc
@@ -124,6 +155,9 @@ ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
 -lboost_serialization
 -lcrypto
 )
+if(ORB_SLAM3_CUDA_SOURCES)
+   target_link_libraries(${PROJECT_NAME} CUDA::cudart)
+endif()
 
 # If RealSense SDK is found the library is added and its examples compiled
 if(realsense2_FOUND)
@@ -388,3 +422,9 @@ endif()
 #DISABLED             Examples_old/Stereo-Inertial/stereo_inertial_realsense_D435i.cc)
 #DISABLED     target_link_libraries(stereo_inertial_realsense_D435i_old ${PROJECT_NAME})
 #DISABLED endif()
+
+if(ORB_SLAM3_CUDA_SOURCES)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/Examples/Benchmarks)
+    add_executable(orb_cuda_check Examples/Benchmarks/orb_cuda_check.cc)
+    target_link_libraries(orb_cuda_check ${PROJECT_NAME})
+endif()
