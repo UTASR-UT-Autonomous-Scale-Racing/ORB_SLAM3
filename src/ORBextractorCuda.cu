@@ -61,7 +61,7 @@ __device__ __forceinline__ int Reflect101(int p, int n)
 // darker (brighter) than the centre, as the smallest difference on the arc.
 // A pixel is a FAST corner at threshold t iff the result is > t, and its
 // score is result - 1.
-__global__ void FastScore(const unsigned char* __restrict__ img, unsigned char* __restrict__ score, Levels L)
+__global__ void FastScore(const unsigned char* __restrict__ img, unsigned char* __restrict__ score, Levels L, int minT)
 {
     const int lv = blockIdx.z;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,9 +76,24 @@ __global__ void FastScore(const unsigned char* __restrict__ img, unsigned char* 
         return;
     }
     const unsigned char* p = img + L.off[lv] + y * w + x;
+    const int v = p[0];
+    // Every 9-pixel arc covers two neighbouring compass pixels (0, 4, 8, 12),
+    // so a pixel whose neighbouring compass pairs never both pass minT can't
+    // be a corner at any threshold used (score stored as 0).
+    {
+        const int c0 = p[3 * w], c1 = p[3], c2 = p[-3 * w], c3 = p[-3];
+        const int dk = v - minT, br = v + minT;
+        const int dark = (c0 < dk) | ((c1 < dk) << 1) | ((c2 < dk) << 2) | ((c3 < dk) << 3);
+        const int brig = (c0 > br) | ((c1 > br) << 1) | ((c2 > br) << 2) | ((c3 > br) << 3);
+        const int rd = (dark | (dark << 4)) >> 1, rb = (brig | (brig << 4)) >> 1;
+        if (!((dark & rd) & 15) && !((brig & rb) & 15))
+        {
+            *out = 0;
+            return;
+        }
+    }
     const int ox[16] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
     const int oy[16] = {3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1, 0, 1, 2, 3};
-    const int v = p[0];
     int d[16];
 #pragma unroll
     for (int k = 0; k < 16; ++k)
@@ -229,27 +244,36 @@ __global__ void CompactLevels(const int* __restrict__ cellCount, const CellDev* 
                               unsigned int* __restrict__ outXY, unsigned char* __restrict__ outScore,
                               int* __restrict__ levelCount)
 {
+    extern __shared__ int start[];          // exclusive prefix of the cell counts, + total
     const int c0 = levelCells[blockIdx.x], c1 = levelCells[blockIdx.x + 1];
-    if (c0 == c1)
-    {
-        if (threadIdx.x == 0)
-            levelCount[blockIdx.x] = 0;
-        return;
-    }
-    const int dst = cells[c0].slot;
-    int run = 0;
-    for (int c = c0; c < c1; ++c)
-    {
-        const int cnt = cellCount[c], src = cells[c].slot;
-        for (int k = threadIdx.x; k < cnt; k += blockDim.x)
-        {
-            outXY[dst + run + k] = xy[src + k];
-            outScore[dst + run + k] = sc[src + k];
-        }
-        run += cnt;
-    }
+    const int nc = c1 - c0;
     if (threadIdx.x == 0)
+    {
+        int run = 0;
+        for (int i = 0; i < nc; ++i)
+        {
+            start[i] = run;
+            run += cellCount[c0 + i];
+        }
+        start[nc] = run;
         levelCount[blockIdx.x] = run;
+    }
+    __syncthreads();
+    if (nc == 0)
+        return;
+    const int total = start[nc], dst = cells[c0].slot;
+    for (int e = threadIdx.x; e < total; e += blockDim.x)
+    {
+        int lo = 0, hi = nc - 1;                // cell holding entry e
+        while (lo < hi)
+        {
+            const int mid = (lo + hi + 1) >> 1;
+            if (start[mid] <= e) lo = mid; else hi = mid - 1;
+        }
+        const int src = cells[c0 + lo].slot + (e - start[lo]);
+        outXY[dst + e] = xy[src];
+        outScore[dst + e] = sc[src];
+    }
 }
 
 // cvRound(x*b + y*a) and cvRound(x*a - y*b) of computeOrbDescriptor, rounded
@@ -459,7 +483,7 @@ void OrbCuda::Detect(const std::vector<cv::Mat>& images, const std::vector<std::
 
     const dim3 block(32, 8);
     const dim3 grid((maxW + block.x - 1) / block.x, (maxH + block.y - 1) / block.y, nlevels);
-    FastScore<<<grid, block, 0, m.stream>>>(m.img.p, m.score.p, L);
+    FastScore<<<grid, block, 0, m.stream>>>(m.img.p, m.score.p, L, std::min(iniThFAST, minThFAST));
     BlurRows<<<grid, block, 0, m.stream>>>(m.img.p, m.rows.p, L);
     BlurCols<<<grid, block, 0, m.stream>>>(m.rows.p, m.blurred.p, L);
 
@@ -500,8 +524,11 @@ void OrbCuda::Detect(const std::vector<cv::Mat>& images, const std::vector<std::
     if (ncells > 0)
         DetectCells<<<ncells, kThreads, 0, m.stream>>>(m.score.p, L, m.cells.p, iniThFAST, minThFAST, minBorder,
                                                        m.xy.p, m.sc.p, m.cellCount.p);
-    CompactLevels<<<nlevels, kThreads, 0, m.stream>>>(m.cellCount.p, m.cells.p, m.levelCells.p, m.xy.p, m.sc.p,
-                                                      m.cxy.p, m.csc.p, m.levelCount.p);
+    int maxCells = 0;
+    for (const auto& c : cellsPerLevel)
+        maxCells = std::max(maxCells, (int)c.size());
+    CompactLevels<<<nlevels, kThreads, (maxCells + 1) * sizeof(int), m.stream>>>(
+        m.cellCount.p, m.cells.p, m.levelCells.p, m.xy.p, m.sc.p, m.cxy.p, m.csc.p, m.levelCount.p);
     m.hLevelCount.Ensure(nlevels);
     CK(cudaMemcpyAsync(m.hLevelCount.p, m.levelCount.p, nlevels * sizeof(int), cudaMemcpyDeviceToHost, m.stream));
     CK(cudaStreamSynchronize(m.stream));
