@@ -1128,30 +1128,31 @@ namespace ORB_SLAM3
         vector<vector<KeyPoint> > candidates;
         mpCuda->Detect(mvImagePyramid, cells, EDGE_THRESHOLD-3, iniThFAST, minThFAST, candidates);
 
-        for (int level = 0; level < nlevels; ++level)
-        {
-            const int minBorderX = EDGE_THRESHOLD-3;
-            const int minBorderY = minBorderX;
-            const int maxBorderX = mvImagePyramid[level].cols-EDGE_THRESHOLD+3;
-            const int maxBorderY = mvImagePyramid[level].rows-EDGE_THRESHOLD+3;
-
-            vector<KeyPoint> & keypoints = allKeypoints[level];
-            keypoints = DistributeOctTree(candidates[level], minBorderX, maxBorderX,
-                                          minBorderY, maxBorderY,mnFeaturesPerLevel[level], level);
-
-            const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
-            const int nkps = keypoints.size();
-            for(int i=0; i<nkps ; i++)
+        // the levels are independent: distribute and orient them in parallel
+        cv::parallel_for_(cv::Range(0, nlevels), [&](const cv::Range& range) {
+            for (int level = range.start; level < range.end; ++level)
             {
-                keypoints[i].pt.x+=minBorderX;
-                keypoints[i].pt.y+=minBorderY;
-                keypoints[i].octave=level;
-                keypoints[i].size = scaledPatchSize;
-            }
-        }
+                const int minBorderX = EDGE_THRESHOLD-3;
+                const int minBorderY = minBorderX;
+                const int maxBorderX = mvImagePyramid[level].cols-EDGE_THRESHOLD+3;
+                const int maxBorderY = mvImagePyramid[level].rows-EDGE_THRESHOLD+3;
 
-        for (int level = 0; level < nlevels; ++level)
-            computeOrientation(mvImagePyramid[level], allKeypoints[level], umax);
+                vector<KeyPoint> & keypoints = allKeypoints[level];
+                keypoints = DistributeOctTree(candidates[level], minBorderX, maxBorderX,
+                                              minBorderY, maxBorderY,mnFeaturesPerLevel[level], level);
+
+                const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
+                const int nkps = keypoints.size();
+                for(int i=0; i<nkps ; i++)
+                {
+                    keypoints[i].pt.x+=minBorderX;
+                    keypoints[i].pt.y+=minBorderY;
+                    keypoints[i].octave=level;
+                    keypoints[i].size = scaledPatchSize;
+                }
+                computeOrientation(mvImagePyramid[level], keypoints, umax);
+            }
+        });
 #else
         ComputeKeyPointsOctTree(allKeypoints);
 #endif
