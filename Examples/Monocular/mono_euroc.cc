@@ -186,6 +186,16 @@ int main(int argc, char **argv)
     // Stop all threads
     SLAM.Shutdown();
 
+    // tracking time per frame
+    {
+        vector<float> t;
+        for (float v : vTimesTrack) if (v > 0) t.push_back(v);
+        sort(t.begin(), t.end());
+        float sum = 0; for (float v : t) sum += v;
+        if (!t.empty())
+            cout << "median tracking time: " << 1e3 * t[t.size() / 2] << " ms, mean: " << 1e3 * sum / t.size() << " ms" << endl;
+    }
+
     // Save camera trajectory
     if (bFileName)
     {

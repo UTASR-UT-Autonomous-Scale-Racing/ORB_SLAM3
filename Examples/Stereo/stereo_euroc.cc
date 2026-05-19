@@ -17,6 +17,7 @@
 */
 
 #include<iostream>
+#include<cstdlib>
 #include<algorithm>
 #include<fstream>
 #include<iomanip>
@@ -88,7 +89,8 @@ int main(int argc, char **argv)
     cout.precision(17);
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, true);
+    // viewer only when there is a display (headless benchmark machines)
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, getenv("DISPLAY") != nullptr);
 
     cv::Mat imLeft, imRight;
     for (seq = 0; seq<num_seq; seq++)
@@ -167,6 +169,16 @@ int main(int argc, char **argv)
     }
     // Stop all threads
     SLAM.Shutdown();
+
+    // tracking time per frame
+    {
+        vector<float> t;
+        for (float v : vTimesTrack) if (v > 0) t.push_back(v);
+        sort(t.begin(), t.end());
+        float sum = 0; for (float v : t) sum += v;
+        if (!t.empty())
+            cout << "median tracking time: " << 1e3 * t[t.size() / 2] << " ms, mean: " << 1e3 * sum / t.size() << " ms" << endl;
+    }
 
     // Save camera trajectory
     if (bFileName)
