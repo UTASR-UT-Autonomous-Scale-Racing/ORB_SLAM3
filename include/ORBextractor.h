@@ -89,6 +89,7 @@ public:
     // ORB_SLAM3_CUDA != 0). Falls back to the CPU on any CUDA error.
     bool UsingCuda() const { return (bool)mpCuda; }
     void DisableCuda() { mpCuda.reset(); }
+    cuda::OrbCuda* Cuda() const { return mpCuda.get(); }
 
 protected:
 

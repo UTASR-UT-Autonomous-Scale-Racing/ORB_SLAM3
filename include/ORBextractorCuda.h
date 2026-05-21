@@ -1,9 +1,9 @@
 /**
- * CUDA stages of the ORB extractor: FAST detection per cell (with the
- * low-threshold retry), the 7x7 Gaussian blur and the rBRIEF descriptors.
- * The results match the CPU path of ORBextractor (same keypoints in the same
- * order, same descriptors); the pyramid, the octree distribution and the
- * orientation stay on the CPU.
+ * CUDA stages of the ORB extractor (FAST per cell with the low-threshold
+ * retry, 7x7 Gaussian blur, rBRIEF descriptors) and of the stereo matching
+ * of Frame::ComputeStereoMatches (candidate search and SAD window search).
+ * Results match the CPU paths bit for bit; the octree distribution, the
+ * orientation and the sub-pixel / depth arithmetic stay on the CPU.
  */
 
 #ifndef ORBEXTRACTORCUDA_H
@@ -46,6 +46,22 @@ public:
                   const std::vector<std::vector<float> >& cosA,
                   const std::vector<std::vector<float> >& sinA,
                   std::vector<cv::Mat>& descriptors);
+
+    // Stereo matching (Frame::ComputeStereoMatches): for every left keypoint,
+    // the best right candidate and the SAD of the 11 window positions,
+    // computed on this extractor's (left) and right's pyramids from the last
+    // Detect(). Keypoints and descriptors are in Frame order.
+    struct StereoCandidate
+    {
+        int bestIdxR;   // -1: no candidate below thOrbDist (or window outside the image)
+        int sad[11];    // SAD at incR = -5..5
+    };
+    void MatchStereo(const OrbCuda& right,
+                     const std::vector<cv::KeyPoint>& keysLeft, const cv::Mat& descLeft,
+                     const std::vector<cv::KeyPoint>& keysRight, const cv::Mat& descRight,
+                     const std::vector<float>& scaleFactors, const std::vector<float>& invScaleFactors,
+                     float minD, float maxD, int thHigh, int thOrbDist,
+                     std::vector<StereoCandidate>& out);
 
 private:
     struct Impl;

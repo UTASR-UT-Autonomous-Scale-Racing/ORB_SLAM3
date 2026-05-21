@@ -323,6 +323,112 @@ __global__ void DescribeKeypoints(const unsigned char* __restrict__ blurred, Lev
     out[i * 32 + byte] = (unsigned char)val;
 }
 
+// One warp per left keypoint (Frame::ComputeStereoMatches): the right
+// keypoint with the lowest descriptor distance among the candidates (row band,
+// octave window, disparity range; the first one on ties, as the CPU loop),
+// then the SAD of the 11x11 window at the 11 horizontal offsets.
+__global__ void StereoMatchKernel(const unsigned char* __restrict__ imgL, Levels LL,
+                                  const unsigned char* __restrict__ imgR, Levels LR,
+                                  const float4* __restrict__ kL, int nL, const float4* __restrict__ kR, int nR,
+                                  const unsigned int* __restrict__ dL, const unsigned int* __restrict__ dR,
+                                  const float* __restrict__ scale, const float* __restrict__ invScale,
+                                  float minD, float maxD, int thHigh, int thOrbDist,
+                                  int* __restrict__ outIdx, int* __restrict__ outSad)
+{
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (i >= nL)
+        return;
+    const float4 kp = kL[i];
+    const float uL = kp.x, vL = kp.y;
+    const int levelL = (int)kp.z;
+    const int row = (int)vL;
+    const float minU = uL - maxD, maxU = uL - minD;
+
+    int best = thHigh, bestIdx = 0x7fffffff;
+    if (maxU >= 0)
+    {
+        unsigned int d[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+            d[k] = dL[i * 8 + k];
+        for (int iR = lane; iR < nR; iR += 32)
+        {
+            const float4 kr = kR[iR];
+            const int oct = (int)kr.z;
+            const float r = 2.0f * scale[oct];
+            const int maxr = (int)ceilf(kr.y + r), minr = (int)floorf(kr.y - r);
+            if (row < minr || row > maxr || oct < levelL - 1 || oct > levelL + 1)
+                continue;
+            if (kr.x >= minU && kr.x <= maxU)
+            {
+                int dist = 0;
+#pragma unroll
+                for (int k = 0; k < 8; ++k)
+                    dist += __popc(d[k] ^ dR[iR * 8 + k]);
+                if (dist < best || (dist == best && iR < bestIdx))
+                {
+                    best = dist;
+                    bestIdx = iR;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+    {
+        const int ob = __shfl_down_sync(0xffffffffu, best, off);
+        const int oi = __shfl_down_sync(0xffffffffu, bestIdx, off);
+        if (ob < best || (ob == best && oi < bestIdx))
+        {
+            best = ob;
+            bestIdx = oi;
+        }
+    }
+    best = __shfl_sync(0xffffffffu, best, 0);
+    bestIdx = __shfl_sync(0xffffffffu, bestIdx, 0);
+    if (best >= thHigh || best >= thOrbDist || bestIdx == 0x7fffffff)
+    {
+        if (lane == 0)
+            outIdx[i] = -1;
+        return;
+    }
+
+    const int w = 5, L = 5;
+    const float sf = invScale[levelL];
+    const int su = (int)roundf(__fmul_rn(uL, sf));
+    const int sv = (int)roundf(__fmul_rn(vL, sf));
+    const int sr = (int)roundf(__fmul_rn(kR[bestIdx].x, sf));
+    const int wl = LL.w[levelL], hl = LL.h[levelL], wr = LR.w[levelL];
+    const int iniu = sr + L - w, endu = sr + L + w + 1;
+    const bool inside = !(iniu < 0 || endu >= wr) && su - w >= 0 && su + w < wl && sv - w >= 0 && sv + w < hl &&
+                        sr - L - w >= 0;
+    if (!inside)
+    {
+        if (lane == 0)
+            outIdx[i] = -1;
+        return;
+    }
+    if (lane < 2 * L + 1)
+    {
+        const int incR = lane - L;
+        const unsigned char* pl = imgL + LL.off[levelL];
+        const unsigned char* pr = imgR + LR.off[levelL];
+        int sad = 0;
+        for (int dy = -w; dy <= w; ++dy)
+        {
+            const unsigned char* rl = pl + (sv + dy) * wl + su;
+            const unsigned char* rr = pr + (sv + dy) * wr + sr + incR;
+#pragma unroll
+            for (int dx = -w; dx <= w; ++dx)
+                sad += abs((int)rl[dx] - (int)rr[dx]);
+        }
+        outSad[i * 11 + lane] = sad;
+    }
+    if (lane == 0)
+        outIdx[i] = bestIdx;
+}
+
 // OpenCV's fixed-point Gaussian kernel for CV_8U (8 fractional bits, rounding
 // error carried from the outside in, centre tap = 1 - rest).
 void FixedPointGaussian(int n, double sigma, unsigned short* k)
@@ -421,6 +527,15 @@ struct OrbCuda::Impl
     HostBuf<int4> hKps;
     HostBuf<float2> hCs;
     std::vector<int> levelSlot;
+    // stereo matching
+    DevBuf<float4> sKL, sKR;
+    DevBuf<unsigned int> sDL, sDR;
+    DevBuf<float> sScale;
+    DevBuf<int> sIdx, sSad;
+    HostBuf<float4> hKL, hKR;
+    HostBuf<unsigned char> hDL, hDR;
+    HostBuf<float> hScale;
+    HostBuf<int> hIdx, hSad;
 };
 
 OrbCuda::OrbCuda(const std::vector<cv::Point>& pattern) : d(new Impl)
@@ -604,6 +719,66 @@ void OrbCuda::Describe(const std::vector<std::vector<cv::KeyPoint> >& keypoints,
         if (nl)
             std::memcpy(descriptors[l].data, m.hDesc.p + (size_t)i * 32, (size_t)nl * 32);
         i += nl;
+    }
+}
+
+void OrbCuda::MatchStereo(const OrbCuda& right,
+                          const std::vector<cv::KeyPoint>& keysLeft, const cv::Mat& descLeft,
+                          const std::vector<cv::KeyPoint>& keysRight, const cv::Mat& descRight,
+                          const std::vector<float>& scaleFactors, const std::vector<float>& invScaleFactors,
+                          float minD, float maxD, int thHigh, int thOrbDist,
+                          std::vector<StereoCandidate>& out)
+{
+    Impl& m = *d;
+    const int nL = (int)keysLeft.size(), nR = (int)keysRight.size(), nlev = (int)scaleFactors.size();
+    out.assign(nL, StereoCandidate{-1, {0}});
+    if (nL == 0 || nR == 0)
+        return;
+    if (!descLeft.isContinuous() || !descRight.isContinuous() || descLeft.cols != 32 || descRight.cols != 32)
+        throw std::runtime_error("stereo matching expects continuous 32-byte descriptors");
+    m.hKL.Ensure(nL);
+    m.hKR.Ensure(nR);
+    m.hDL.Ensure((size_t)nL * 32);
+    m.hDR.Ensure((size_t)nR * 32);
+    m.hScale.Ensure(2 * nlev);
+    for (int i = 0; i < nL; ++i)
+        m.hKL.p[i] = make_float4(keysLeft[i].pt.x, keysLeft[i].pt.y, (float)keysLeft[i].octave, 0.f);
+    for (int i = 0; i < nR; ++i)
+        m.hKR.p[i] = make_float4(keysRight[i].pt.x, keysRight[i].pt.y, (float)keysRight[i].octave, 0.f);
+    std::memcpy(m.hDL.p, descLeft.data, (size_t)nL * 32);
+    std::memcpy(m.hDR.p, descRight.data, (size_t)nR * 32);
+    for (int l = 0; l < nlev; ++l)
+    {
+        m.hScale.p[l] = scaleFactors[l];
+        m.hScale.p[nlev + l] = invScaleFactors[l];
+    }
+    m.sKL.Ensure(nL);
+    m.sKR.Ensure(nR);
+    m.sDL.Ensure((size_t)nL * 8);
+    m.sDR.Ensure((size_t)nR * 8);
+    m.sScale.Ensure(2 * nlev);
+    m.sIdx.Ensure(nL);
+    m.sSad.Ensure((size_t)nL * 11);
+    CK(cudaMemcpyAsync(m.sKL.p, m.hKL.p, nL * sizeof(float4), cudaMemcpyHostToDevice, m.stream));
+    CK(cudaMemcpyAsync(m.sKR.p, m.hKR.p, nR * sizeof(float4), cudaMemcpyHostToDevice, m.stream));
+    CK(cudaMemcpyAsync(m.sDL.p, m.hDL.p, (size_t)nL * 32, cudaMemcpyHostToDevice, m.stream));
+    CK(cudaMemcpyAsync(m.sDR.p, m.hDR.p, (size_t)nR * 32, cudaMemcpyHostToDevice, m.stream));
+    CK(cudaMemcpyAsync(m.sScale.p, m.hScale.p, 2 * nlev * sizeof(float), cudaMemcpyHostToDevice, m.stream));
+    const int threads = 128;
+    StereoMatchKernel<<<(nL * 32 + threads - 1) / threads, threads, 0, m.stream>>>(
+        m.img.p, m.levels, right.d->img.p, right.d->levels, m.sKL.p, nL, m.sKR.p, nR, m.sDL.p, m.sDR.p,
+        m.sScale.p, m.sScale.p + nlev, minD, maxD, thHigh, thOrbDist, m.sIdx.p, m.sSad.p);
+    m.hIdx.Ensure(nL);
+    m.hSad.Ensure((size_t)nL * 11);
+    CK(cudaMemcpyAsync(m.hIdx.p, m.sIdx.p, nL * sizeof(int), cudaMemcpyDeviceToHost, m.stream));
+    CK(cudaMemcpyAsync(m.hSad.p, m.sSad.p, (size_t)nL * 11 * sizeof(int), cudaMemcpyDeviceToHost, m.stream));
+    CK(cudaStreamSynchronize(m.stream));
+    CK(cudaGetLastError());
+    for (int i = 0; i < nL; ++i)
+    {
+        out[i].bestIdxR = m.hIdx.p[i];
+        if (out[i].bestIdxR >= 0)
+            std::memcpy(out[i].sad, m.hSad.p + (size_t)i * 11, sizeof(out[i].sad));
     }
 }
 
