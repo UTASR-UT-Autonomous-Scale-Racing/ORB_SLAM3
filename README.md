@@ -95,6 +95,56 @@ chmod +x build.sh
 
 This will create **libORB_SLAM3.so**  at *lib* folder and the executables in *Examples* folder.
 
+## CUDA ORB extractor
+
+On a machine with a CUDA toolkit, the build adds a GPU path for the ORB extractor
+(`src/ORBextractorCuda.cu`): FAST detection per cell (with the low-threshold retry),
+the 7x7 Gaussian blur and the rBRIEF descriptors run on the GPU; the image pyramid, the
+octree distribution and the orientation stay on the CPU. The GPU path reproduces
+OpenCV's integer arithmetic, so it returns **the same keypoints and descriptors** as the
+CPU path.
+
+```
+cmake -S . -B build -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+      -DCMAKE_CUDA_ARCHITECTURES=89        # 87 for Jetson Orin
+```
+
+`-DORB_SLAM3_WITH_CUDA=OFF` builds the CPU-only library. At run time `ORB_SLAM3_CUDA=0`
+selects the CPU path; any CUDA error also falls back to it.
+
+Checks (EuRoC, `mav0/cam0/data` of each sequence):
+
+```
+./Examples/Benchmarks/orb_cuda_check <sequence>/mav0/cam0/data     # CPU vs CUDA: identical output, timing
+./Examples/Benchmarks/euroc_cpu_vs_cuda.sh <euroc_dir> results      # SLAM: tracking time and ATE
+python3 evaluation/ate.py evaluation/Ground_truth/EuRoC_left_cam/V101_GT.txt f_<run>.txt [--scale]
+```
+
+Results on an RTX 4080 with an i7-13700 (pinned to the performance cores), EuRoC
+Vicon Room 1, 752x480, 1200 features:
+
+| Sequence | Frames | Keypoints / descriptor bits different | Extractor CPU | Extractor CUDA |
+| -------- | ------ | ------------------------------------- | ------------- | -------------- |
+| V1_01 | 2912 | 0 of 3,485,591 / 0 | 6.03 ms | 1.08 ms (5.6x) |
+| V1_02 | 1710 | 0 of 2,046,172 / 0 | 5.39 ms | 1.05 ms (5.1x) |
+| V1_03 | 2149 | 0 of 2,487,578 / 0 | 5.20 ms | 1.05 ms (4.9x) |
+
+SLAM (median tracking time per frame over the runs; ATE RMSE of each run, SE(3)
+alignment for stereo, Sim(3) for monocular):
+
+| Sequence | Mode | Tracking CPU | Tracking CUDA | ATE CPU (cm) | ATE CUDA (cm) |
+| -------- | ---- | ------------ | ------------- | ------------ | ------------- |
+| V1_01 | stereo | 21.1 ms | 10.4 ms | 3.7, 3.8, 3.4 | 5.7, 3.9, 3.6 |
+| V1_02 | stereo | 20.8 ms | 16.4 ms | 4.2, 4.2, 3.8 | 4.0, 4.0, 3.9 |
+| V1_03 | stereo | 19.8 ms | 16.9 ms | 13.6, 22.8, 6.1 | 15.0, 11.6, 6.4 |
+| V1_01 | mono | 10.8 ms | 7.4 ms | 3.6, 3.4 | 3.3, 3.2 |
+| V1_02 | mono | 9.8 ms | 6.5 ms | 1.5, 1.2 | 1.3, 1.4 |
+| V1_03 | mono | 9.5 ms | 6.4 ms | 4.2, 6.7 | 6.3, 5.4 |
+
+Accuracy is the same within ORB-SLAM3's run-to-run spread (its mapping threads are not
+deterministic). In stereo the rest of tracking (stereo matching, pose optimisation)
+dominates, so the gain is smaller than for the extractor alone.
+
 # 4. Running ORB-SLAM3 with your camera
 
 Directory `Examples` contains several demo programs and calibration files to run ORB-SLAM3 in all sensor configurations with Intel Realsense cameras T265 and D435i. The steps needed to use your own camera are: 
