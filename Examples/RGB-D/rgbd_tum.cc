@@ -17,6 +17,7 @@
 */
 
 #include<iostream>
+#include<cstdlib>
 #include<algorithm>
 #include<fstream>
 #include<chrono>
@@ -59,7 +60,8 @@ int main(int argc, char **argv)
     }
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::RGBD,true);
+    // viewer only when there is a display (headless benchmark machines)
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::RGBD,getenv("DISPLAY") != nullptr);
     float imageScale = SLAM.GetImageScale();
 
     // Vector for tracking time statistics

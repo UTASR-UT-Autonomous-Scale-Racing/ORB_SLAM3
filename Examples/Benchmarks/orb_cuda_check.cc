@@ -4,12 +4,15 @@
  * and prints the time per frame of both.
  *
  *   orb_cuda_check <image_dir> [n_frames=300] [n_features=1200]
+ *   orb_cuda_check --stereo <mav0_dir> [n_frames=300] [n_features=1200]
+ *     times left + right extraction in two threads, as Frame does for stereo
  */
 
 #include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -33,8 +36,41 @@ static double Mean(const vector<double>& v)
     return v.empty() ? 0.0 : s / v.size();
 }
 
+static int Stereo(const string& mav0, int nFrames, int nFeatures)
+{
+    vector<cv::String> left, right;
+    cv::glob(mav0 + "/cam0/data/*.png", left, false);
+    cv::glob(mav0 + "/cam1/data/*.png", right, false);
+    sort(left.begin(), left.end());
+    sort(right.begin(), right.end());
+    const size_t n = min({left.size(), right.size(), (size_t)nFrames});
+    vector<int> lapping = {0, 1000};
+    for (int useCuda = 0; useCuda < 2; ++useCuda)
+    {
+        ORB_SLAM3::ORBextractor l(nFeatures, 1.2f, 8, 20, 7), r(nFeatures, 1.2f, 8, 20, 7);
+        if (!useCuda) { l.DisableCuda(); r.DisableCuda(); }
+        vector<double> t;
+        for (size_t f = 0; f < n; ++f)
+        {
+            cv::Mat il = cv::imread(left[f], cv::IMREAD_GRAYSCALE), ir = cv::imread(right[f], cv::IMREAD_GRAYSCALE);
+            vector<cv::KeyPoint> kl, kr;
+            cv::Mat dl, dr;
+            auto t0 = chrono::steady_clock::now();
+            thread tl([&] { l(il, cv::Mat(), kl, dl, lapping); });
+            thread tr([&] { r(ir, cv::Mat(), kr, dr, lapping); });
+            tl.join();
+            tr.join();
+            if (f >= 5) t.push_back(chrono::duration<double, milli>(chrono::steady_clock::now() - t0).count());
+        }
+        cout << (useCuda ? "CUDA" : "CPU ") << " stereo ms/frame: mean " << Mean(t) << ", median " << Median(t) << endl;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
+    if (argc > 2 && string(argv[1]) == "--stereo")
+        return Stereo(argv[2], argc > 3 ? stoi(argv[3]) : 300, argc > 4 ? stoi(argv[4]) : 1200);
     if (argc < 2)
     {
         cerr << "usage: orb_cuda_check <image_dir> [n_frames=300] [n_features=1200]" << endl;
