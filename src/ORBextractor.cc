@@ -58,6 +58,7 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <vector>
 #include <iostream>
+#include <cstdlib>
 
 #include "ORBextractor.h"
 #ifdef ORB_SLAM3_WITH_CUDA
@@ -472,6 +473,8 @@ namespace ORB_SLAM3
 #ifdef ORB_SLAM3_WITH_CUDA
         if (cuda::Enabled())
         {
+            const char* pyr = getenv("ORB_SLAM3_CUDA_PYRAMID");
+            mbCudaCpuPyramid = pyr && string(pyr) == "cpu";
             try { mpCuda = std::make_shared<cuda::OrbCuda>(pattern); }
             catch (const std::exception& e) { cerr << "[ORBextractor] CUDA unavailable, using the CPU: " << e.what() << endl; }
         }
@@ -1177,9 +1180,6 @@ namespace ORB_SLAM3
         Mat image = _image.getMat();
         assert(image.type() == CV_8UC1 );
 
-        // Pre-compute the scale pyramid
-        ComputePyramid(image);
-
         vector < vector<KeyPoint> > allKeypoints;
         vector<Mat> gpuDescriptors;
         bool gpu = false;
@@ -1188,6 +1188,11 @@ namespace ORB_SLAM3
         {
             try
             {
+                // Pre-compute the scale pyramid
+                if (mbCudaCpuPyramid)
+                    ComputePyramid(image);
+                else
+                    mpCuda->BuildPyramid(image, mvInvScaleFactor, mvImagePyramid);
                 ComputeKeyPointsOctTreeCuda(allKeypoints);
                 vector<vector<float> > cosA(nlevels), sinA(nlevels);
                 for (int level = 0; level < nlevels; ++level)
@@ -1209,7 +1214,11 @@ namespace ORB_SLAM3
         }
 #endif
         if (!gpu)
+        {
+            // Pre-compute the scale pyramid
+            ComputePyramid(image);
             ComputeKeyPointsOctTree(allKeypoints);
+        }
 
         Mat descriptors;
 

@@ -90,6 +90,9 @@ public:
     bool UsingCuda() const { return (bool)mpCuda; }
     void DisableCuda() { mpCuda.reset(); }
     cuda::OrbCuda* Cuda() const { return mpCuda.get(); }
+    // CUDA path: build the pyramid on the CPU (cv::resize) instead of NPP, for
+    // results identical to the CPU path. Default from ORB_SLAM3_CUDA_PYRAMID=cpu.
+    void SetCudaCpuPyramid(bool cpu) { mbCudaCpuPyramid = cpu; }
 
 protected:
 
@@ -102,6 +105,7 @@ protected:
     void ComputeKeyPointsOctTreeCuda(std::vector<std::vector<cv::KeyPoint> >& allKeypoints);
 
     std::shared_ptr<cuda::OrbCuda> mpCuda;
+    bool mbCudaCpuPyramid = false;
     std::vector<cv::Point> pattern;
 
     int nfeatures;
