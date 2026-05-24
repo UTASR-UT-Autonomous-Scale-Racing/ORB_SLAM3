@@ -156,7 +156,7 @@ ${PROJECT_SOURCE_DIR}/Thirdparty/g2o/lib/libg2o.so
 -lcrypto
 )
 if(ORB_SLAM3_CUDA_SOURCES)
-   target_link_libraries(${PROJECT_NAME} CUDA::cudart)
+   target_link_libraries(${PROJECT_NAME} CUDA::cudart CUDA::nppig CUDA::nppc)
 endif()
 
 # If RealSense SDK is found the library is added and its examples compiled

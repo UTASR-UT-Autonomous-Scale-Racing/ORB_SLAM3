@@ -8,6 +8,7 @@
 #include "ORBextractorCuda.h"
 
 #include <cuda_runtime.h>
+#include <npp.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -527,6 +528,12 @@ struct OrbCuda::Impl
     HostBuf<int4> hKps;
     HostBuf<float2> hCs;
     std::vector<int> levelSlot;
+    // GPU pyramid
+    cudaStream_t copyStream = nullptr;
+    cudaEvent_t pyramidBuilt = nullptr;
+    NppStreamContext npp{};
+    bool pyramidOnDevice = false;
+    HostBuf<unsigned char> hPyr;
     // stereo matching
     DevBuf<float4> sKL, sKR;
     DevBuf<unsigned int> sDL, sDR;
@@ -555,12 +562,85 @@ OrbCuda::OrbCuda(const std::vector<cv::Point>& pattern) : d(new Impl)
         CK(cudaMemcpyToSymbol(c_blur, k, sizeof(k)));
     });
     CK(cudaStreamCreateWithFlags(&d->stream, cudaStreamNonBlocking));
+    CK(cudaStreamCreateWithFlags(&d->copyStream, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&d->pyramidBuilt, cudaEventDisableTiming));
+    int dev = 0;
+    CK(cudaGetDevice(&dev));
+    cudaDeviceProp prop;
+    CK(cudaGetDeviceProperties(&prop, dev));
+    NppStreamContext& c = d->npp;
+    c.hStream = d->stream;
+    c.nCudaDeviceId = dev;
+    c.nMultiProcessorCount = prop.multiProcessorCount;
+    c.nMaxThreadsPerMultiProcessor = prop.maxThreadsPerMultiProcessor;
+    c.nMaxThreadsPerBlock = prop.maxThreadsPerBlock;
+    c.nSharedMemPerBlock = prop.sharedMemPerBlock;
+    c.nCudaDevAttrComputeCapabilityMajor = prop.major;
+    c.nCudaDevAttrComputeCapabilityMinor = prop.minor;
+    CK(cudaStreamGetFlags(d->stream, &c.nStreamFlags));
 }
 
 OrbCuda::~OrbCuda()
 {
+    if (d->pyramidBuilt)
+        cudaEventDestroy(d->pyramidBuilt);
+    if (d->copyStream)
+        cudaStreamDestroy(d->copyStream);
     if (d->stream)
         cudaStreamDestroy(d->stream);
+}
+
+void OrbCuda::BuildPyramid(const cv::Mat& image, const std::vector<float>& invScaleFactors,
+                           std::vector<cv::Mat>& levels)
+{
+    Impl& m = *d;
+    const int nlevels = (int)invScaleFactors.size();
+    if (nlevels > kMaxLevels)
+        throw std::runtime_error("too many pyramid levels for the CUDA extractor");
+    if (image.type() != CV_8UC1)
+        throw std::runtime_error("the CUDA pyramid expects an 8-bit grey image");
+    Levels& L = m.levels;
+    L.n = nlevels;
+    int total = 0;
+    for (int l = 0; l < nlevels; ++l)
+    {
+        // same level sizes as ORBextractor::ComputePyramid
+        L.w[l] = cvRound((float)image.cols * invScaleFactors[l]);
+        L.h[l] = cvRound((float)image.rows * invScaleFactors[l]);
+        L.off[l] = total;
+        total += L.w[l] * L.h[l];
+    }
+    m.totalPixels = total;
+    m.img.Ensure(total);
+    m.score.Ensure(total);
+    m.blurred.Ensure(total);
+    m.rows.Ensure(total);
+    m.hPyr.Ensure(total);
+    m.hImg.Ensure(L.w[0] * L.h[0]);
+    for (int y = 0; y < L.h[0]; ++y)
+        std::memcpy(m.hImg.p + y * L.w[0], image.ptr<unsigned char>(y), L.w[0]);
+    CK(cudaMemcpyAsync(m.img.p, m.hImg.p, L.w[0] * L.h[0], cudaMemcpyHostToDevice, m.stream));
+    for (int l = 1; l < nlevels; ++l)
+    {
+        // nppiResizeSqrPixel samples pixel centres like cv::resize (plain
+        // nppiResize is corner-aligned, a sub-pixel shift per level); the
+        // results differ from cv::resize by at most 1 grey level (rounding)
+        const NppiSize src{L.w[l - 1], L.h[l - 1]};
+        const double fx = (double)L.w[l] / L.w[l - 1], fy = (double)L.h[l] / L.h[l - 1];
+        const NppStatus st = nppiResizeSqrPixel_8u_C1R_Ctx(
+            m.img.p + L.off[l - 1], src, L.w[l - 1], NppiRect{0, 0, src.width, src.height},
+            m.img.p + L.off[l], L.w[l], NppiRect{0, 0, L.w[l], L.h[l]}, fx, fy, 0.0, 0.0, NPPI_INTER_LINEAR, m.npp);
+        if (st != NPP_SUCCESS)
+            throw std::runtime_error("nppiResizeSqrPixel failed: " + std::to_string((int)st));
+    }
+    // host copy for the CPU stages, overlapping the detection kernels
+    CK(cudaEventRecord(m.pyramidBuilt, m.stream));
+    CK(cudaStreamWaitEvent(m.copyStream, m.pyramidBuilt, 0));
+    CK(cudaMemcpyAsync(m.hPyr.p, m.img.p, total, cudaMemcpyDeviceToHost, m.copyStream));
+    levels.resize(nlevels);
+    for (int l = 0; l < nlevels; ++l)
+        levels[l] = cv::Mat(L.h[l], L.w[l], CV_8U, m.hPyr.p + L.off[l]);
+    m.pyramidOnDevice = true;
 }
 
 void OrbCuda::Detect(const std::vector<cv::Mat>& images, const std::vector<std::vector<Cell> >& cellsPerLevel,
@@ -572,29 +652,41 @@ void OrbCuda::Detect(const std::vector<cv::Mat>& images, const std::vector<std::
     if (nlevels > kMaxLevels)
         throw std::runtime_error("too many pyramid levels for the CUDA extractor");
 
-    // pack the levels into pinned memory and upload
     Levels& L = m.levels;
-    L.n = nlevels;
-    int total = 0, maxW = 0, maxH = 0;
+    int maxW = 0, maxH = 0;
+    if (m.pyramidOnDevice)
+    {
+        if (L.n != nlevels)
+            throw std::runtime_error("pyramid levels changed between BuildPyramid and Detect");
+    }
+    else
+    {
+        // pack the CPU pyramid into pinned memory and upload
+        L.n = nlevels;
+        int total = 0;
+        for (int l = 0; l < nlevels; ++l)
+        {
+            L.w[l] = images[l].cols;
+            L.h[l] = images[l].rows;
+            L.off[l] = total;
+            total += L.w[l] * L.h[l];
+        }
+        m.totalPixels = total;
+        m.hImg.Ensure(total);
+        for (int l = 0; l < nlevels; ++l)
+            for (int y = 0; y < L.h[l]; ++y)
+                std::memcpy(m.hImg.p + L.off[l] + y * L.w[l], images[l].ptr<unsigned char>(y), L.w[l]);
+        m.img.Ensure(total);
+        m.score.Ensure(total);
+        m.blurred.Ensure(total);
+        m.rows.Ensure(total);
+        CK(cudaMemcpyAsync(m.img.p, m.hImg.p, total, cudaMemcpyHostToDevice, m.stream));
+    }
     for (int l = 0; l < nlevels; ++l)
     {
-        L.w[l] = images[l].cols;
-        L.h[l] = images[l].rows;
-        L.off[l] = total;
-        total += L.w[l] * L.h[l];
         maxW = std::max(maxW, L.w[l]);
         maxH = std::max(maxH, L.h[l]);
     }
-    m.totalPixels = total;
-    m.hImg.Ensure(total);
-    for (int l = 0; l < nlevels; ++l)
-        for (int y = 0; y < L.h[l]; ++y)
-            std::memcpy(m.hImg.p + L.off[l] + y * L.w[l], images[l].ptr<unsigned char>(y), L.w[l]);
-    m.img.Ensure(total);
-    m.score.Ensure(total);
-    m.blurred.Ensure(total);
-    m.rows.Ensure(total);
-    CK(cudaMemcpyAsync(m.img.p, m.hImg.p, total, cudaMemcpyHostToDevice, m.stream));
 
     const dim3 block(32, 8);
     const dim3 grid((maxW + block.x - 1) / block.x, (maxH + block.y - 1) / block.y, nlevels);
@@ -647,6 +739,11 @@ void OrbCuda::Detect(const std::vector<cv::Mat>& images, const std::vector<std::
     m.hLevelCount.Ensure(nlevels);
     CK(cudaMemcpyAsync(m.hLevelCount.p, m.levelCount.p, nlevels * sizeof(int), cudaMemcpyDeviceToHost, m.stream));
     CK(cudaStreamSynchronize(m.stream));
+    if (m.pyramidOnDevice)
+    {
+        CK(cudaStreamSynchronize(m.copyStream));   // host pyramid ready for the CPU stages
+        m.pyramidOnDevice = false;
+    }
     CK(cudaGetLastError());
 
     m.hXY.Ensure(std::max(slots, 1));

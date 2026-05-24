@@ -2,7 +2,9 @@
  * CUDA stages of the ORB extractor (FAST per cell with the low-threshold
  * retry, 7x7 Gaussian blur, rBRIEF descriptors) and of the stereo matching
  * of Frame::ComputeStereoMatches (candidate search and SAD window search).
- * Results match the CPU paths bit for bit; the octree distribution, the
+ * The image pyramid is built with NPP (nppiResizeSqrPixel), which rounds
+ * slightly differently from cv::resize (at most 1 grey level); with the CPU pyramid (ORB_SLAM3_CUDA_PYRAMID=cpu)
+ * all results match the CPU paths bit for bit. The octree distribution, the
  * orientation and the sub-pixel / depth arithmetic stay on the CPU.
  */
 
@@ -33,7 +35,15 @@ public:
     explicit OrbCuda(const std::vector<cv::Point>& pattern);
     ~OrbCuda();
 
-    // Uploads the pyramid levels, blurs them and runs FAST in every cell.
+    // Builds the pyramid on the GPU (NPP bilinear resize, pixel-centre aligned
+    // like cv::resize, level from level)
+    // and returns host views of it in levels (valid until the next call). The
+    // next Detect() uses the device copy instead of uploading.
+    void BuildPyramid(const cv::Mat& image, const std::vector<float>& invScaleFactors,
+                      std::vector<cv::Mat>& levels);
+
+    // Uploads the pyramid levels (unless BuildPyramid made them), blurs them
+    // and runs FAST in every cell.
     // out[level] holds the keypoints in the CPU order (cell by cell, row-major
     // inside a cell), pt relative to (minBorder, minBorder), as FAST returns them.
     void Detect(const std::vector<cv::Mat>& levels, const std::vector<std::vector<Cell> >& cells,
