@@ -21,11 +21,14 @@
 
 #include <vector>
 #include <list>
+#include <memory>
 #include <opencv2/opencv.hpp>
 
 
 namespace ORB_SLAM3
 {
+
+namespace cuda { class OrbCuda; }
 
 class ExtractorNode
 {
@@ -82,6 +85,15 @@ public:
 
     std::vector<cv::Mat> mvImagePyramid;
 
+    // FAST, blur and descriptors on the GPU (built with CUDA, device present,
+    // ORB_SLAM3_CUDA != 0). Falls back to the CPU on any CUDA error.
+    bool UsingCuda() const { return (bool)mpCuda; }
+    void DisableCuda() { mpCuda.reset(); }
+    cuda::OrbCuda* Cuda() const { return mpCuda.get(); }
+    // CUDA path: build the pyramid on the CPU (cv::resize) instead of NPP, for
+    // results identical to the CPU path. Default from ORB_SLAM3_CUDA_PYRAMID=cpu.
+    void SetCudaCpuPyramid(bool cpu) { mbCudaCpuPyramid = cpu; }
+
 protected:
 
     void ComputePyramid(cv::Mat image);
@@ -90,6 +102,10 @@ protected:
                                            const int &maxX, const int &minY, const int &maxY, const int &nFeatures, const int &level);
 
     void ComputeKeyPointsOld(std::vector<std::vector<cv::KeyPoint> >& allKeypoints);
+    void ComputeKeyPointsOctTreeCuda(std::vector<std::vector<cv::KeyPoint> >& allKeypoints);
+
+    std::shared_ptr<cuda::OrbCuda> mpCuda;
+    bool mbCudaCpuPyramid = false;
     std::vector<cv::Point> pattern;
 
     int nfeatures;

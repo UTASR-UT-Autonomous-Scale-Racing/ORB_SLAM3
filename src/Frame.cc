@@ -24,6 +24,11 @@
 #include "ORBextractor.h"
 #include "Converter.h"
 #include "ORBmatcher.h"
+#ifdef ORB_SLAM3_WITH_CUDA
+#include "ORBextractorCuda.h"
+#endif
+#include <atomic>
+#include <cstdlib>
 #include "GeometricCamera.h"
 
 #include <thread>
@@ -810,6 +815,41 @@ void Frame::ComputeImageBounds(const cv::Mat &imLeft)
 
 void Frame::ComputeStereoMatches()
 {
+#ifdef ORB_SLAM3_WITH_CUDA
+    const bool gpu = mpORBextractorLeft->Cuda() && mpORBextractorRight->Cuda();
+    if(gpu)
+    {
+        try
+        {
+            ComputeStereoMatches(true, mvuRight, mvDepth);
+            static const bool verify = getenv("ORB_SLAM3_CUDA_VERIFY") && string(getenv("ORB_SLAM3_CUDA_VERIFY")) == "1";
+            if(verify)
+            {
+                // debug: compare with the CPU path
+                static std::atomic<long> frames{0}, diff{0};
+                static struct Report { ~Report() { cerr << "[stereo verify] frames " << frames << ", keypoints with a different match: " << diff << endl; } } report;
+                vector<float> uR, depth;
+                ComputeStereoMatches(false, uR, depth);
+                for(int i=0; i<N; i++)
+                    if(uR[i] != mvuRight[i] || depth[i] != mvDepth[i])
+                        diff++;
+                frames++;
+            }
+            return;
+        }
+        catch(const std::exception& e)
+        {
+            cerr << "[Frame] CUDA stereo matching failed, using the CPU: " << e.what() << endl;
+        }
+    }
+#endif
+    ComputeStereoMatches(false, mvuRight, mvDepth);
+}
+
+void Frame::ComputeStereoMatches(bool useCuda, vector<float>& uRightOut, vector<float>& depthOut)
+{
+    vector<float>& mvuRight = uRightOut;
+    vector<float>& mvDepth = depthOut;
     mvuRight = vector<float>(N,-1.0f);
     mvDepth = vector<float>(N,-1.0f);
 
@@ -818,12 +858,12 @@ void Frame::ComputeStereoMatches()
     const int nRows = mpORBextractorLeft->mvImagePyramid[0].rows;
 
     //Assign keypoints to row table
-    vector<vector<size_t> > vRowIndices(nRows,vector<size_t>());
+    vector<vector<size_t> > vRowIndices(useCuda ? 0 : nRows,vector<size_t>());
 
-    for(int i=0; i<nRows; i++)
+    for(int i=0; i<(int)vRowIndices.size(); i++)
         vRowIndices[i].reserve(200);
 
-    const int Nr = mvKeysRight.size();
+    const int Nr = useCuda ? 0 : mvKeysRight.size();
 
     for(int iR=0; iR<Nr; iR++)
     {
@@ -842,6 +882,15 @@ void Frame::ComputeStereoMatches()
     const float minD = 0;
     const float maxD = mbf/minZ;
 
+#ifdef ORB_SLAM3_WITH_CUDA
+    // candidate search and SAD window search on the GPU, rest as below
+    vector<cuda::OrbCuda::StereoCandidate> vGpu;
+    if(useCuda)
+        mpORBextractorLeft->Cuda()->MatchStereo(*mpORBextractorRight->Cuda(), mvKeys, mDescriptors, mvKeysRight,
+                                                mDescriptorsRight, mvScaleFactors, mvInvScaleFactors, minD, maxD,
+                                                ORBmatcher::TH_HIGH, thOrbDist, vGpu);
+#endif
+
     // For each left keypoint search a match in the right image
     vector<pair<int, int> > vDistIdx;
     vDistIdx.reserve(N);
@@ -853,6 +902,19 @@ void Frame::ComputeStereoMatches()
         const float &vL = kpL.pt.y;
         const float &uL = kpL.pt.x;
 
+        int bestDist = ORBmatcher::TH_HIGH;
+        size_t bestIdxR = 0;
+#ifdef ORB_SLAM3_WITH_CUDA
+        if(useCuda)
+        {
+            if(vGpu[iL].bestIdxR < 0)
+                continue;
+            bestIdxR = vGpu[iL].bestIdxR;
+            bestDist = 0;   // below thOrbDist, checked on the GPU
+        }
+        else
+#endif
+        {
         const vector<size_t> &vCandidates = vRowIndices[vL];
 
         if(vCandidates.empty())
@@ -863,9 +925,6 @@ void Frame::ComputeStereoMatches()
 
         if(maxU<0)
             continue;
-
-        int bestDist = ORBmatcher::TH_HIGH;
-        size_t bestIdxR = 0;
 
         const cv::Mat &dL = mDescriptors.row(iL);
 
@@ -892,6 +951,7 @@ void Frame::ComputeStereoMatches()
                 }
             }
         }
+        }
 
         // Subpixel match by correlation
         if(bestDist<thOrbDist)
@@ -905,7 +965,9 @@ void Frame::ComputeStereoMatches()
 
             // sliding window search
             const int w = 5;
-            cv::Mat IL = mpORBextractorLeft->mvImagePyramid[kpL.octave].rowRange(scaledvL-w,scaledvL+w+1).colRange(scaleduL-w,scaleduL+w+1);
+            cv::Mat IL;
+            if(!useCuda)
+                IL = mpORBextractorLeft->mvImagePyramid[kpL.octave].rowRange(scaledvL-w,scaledvL+w+1).colRange(scaleduL-w,scaleduL+w+1);
 
             int bestDist = INT_MAX;
             int bestincR = 0;
@@ -920,9 +982,16 @@ void Frame::ComputeStereoMatches()
 
             for(int incR=-L; incR<=+L; incR++)
             {
+                float dist;
+#ifdef ORB_SLAM3_WITH_CUDA
+                if(useCuda)
+                    dist = vGpu[iL].sad[L+incR];
+                else
+#endif
+                {
                 cv::Mat IR = mpORBextractorRight->mvImagePyramid[kpL.octave].rowRange(scaledvL-w,scaledvL+w+1).colRange(scaleduR0+incR-w,scaleduR0+incR+w+1);
-
-                float dist = cv::norm(IL,IR,cv::NORM_L1);
+                dist = cv::norm(IL,IR,cv::NORM_L1);
+                }
                 if(dist<bestDist)
                 {
                     bestDist =  dist;

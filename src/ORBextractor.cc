@@ -58,8 +58,12 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <vector>
 #include <iostream>
+#include <cstdlib>
 
 #include "ORBextractor.h"
+#ifdef ORB_SLAM3_WITH_CUDA
+#include "ORBextractorCuda.h"
+#endif
 
 
 using namespace cv;
@@ -466,6 +470,15 @@ namespace ORB_SLAM3
             umax[v] = v0;
             ++v0;
         }
+#ifdef ORB_SLAM3_WITH_CUDA
+        if (cuda::Enabled())
+        {
+            const char* pyr = getenv("ORB_SLAM3_CUDA_PYRAMID");
+            mbCudaCpuPyramid = pyr && string(pyr) == "cpu";
+            try { mpCuda = std::make_shared<cuda::OrbCuda>(pattern); }
+            catch (const std::exception& e) { cerr << "[ORBextractor] CUDA unavailable, using the CPU: " << e.what() << endl; }
+        }
+#endif
     }
 
     static void computeOrientation(const Mat& image, vector<KeyPoint>& keypoints, const vector<int>& umax)
@@ -1074,6 +1087,80 @@ namespace ORB_SLAM3
             computeOrientation(mvImagePyramid[level], allKeypoints[level], umax);
     }
 
+    void ORBextractor::ComputeKeyPointsOctTreeCuda(vector<vector<KeyPoint> >& allKeypoints)
+    {
+#ifdef ORB_SLAM3_WITH_CUDA
+        allKeypoints.resize(nlevels);
+        const float W = 35;
+
+        // same cells as ComputeKeyPointsOctTree
+        vector<vector<cuda::Cell> > cells(nlevels);
+        for (int level = 0; level < nlevels; ++level)
+        {
+            const int minBorderX = EDGE_THRESHOLD-3;
+            const int minBorderY = minBorderX;
+            const int maxBorderX = mvImagePyramid[level].cols-EDGE_THRESHOLD+3;
+            const int maxBorderY = mvImagePyramid[level].rows-EDGE_THRESHOLD+3;
+            const float width = (maxBorderX-minBorderX);
+            const float height = (maxBorderY-minBorderY);
+            const int nCols = width/W;
+            const int nRows = height/W;
+            const int wCell = ceil(width/nCols);
+            const int hCell = ceil(height/nRows);
+            for(int i=0; i<nRows; i++)
+            {
+                const float iniY =minBorderY+i*hCell;
+                float maxY = iniY+hCell+6;
+                if(iniY>=maxBorderY-3)
+                    continue;
+                if(maxY>maxBorderY)
+                    maxY = maxBorderY;
+                for(int j=0; j<nCols; j++)
+                {
+                    const float iniX =minBorderX+j*wCell;
+                    float maxX = iniX+wCell+6;
+                    if(iniX>=maxBorderX-6)
+                        continue;
+                    if(maxX>maxBorderX)
+                        maxX = maxBorderX;
+                    cells[level].push_back(cuda::Cell{(int)iniX, (int)iniY, (int)maxX, (int)maxY});
+                }
+            }
+        }
+
+        vector<vector<KeyPoint> > candidates;
+        mpCuda->Detect(mvImagePyramid, cells, EDGE_THRESHOLD-3, iniThFAST, minThFAST, candidates);
+
+        // the levels are independent: distribute and orient them in parallel
+        cv::parallel_for_(cv::Range(0, nlevels), [&](const cv::Range& range) {
+            for (int level = range.start; level < range.end; ++level)
+            {
+                const int minBorderX = EDGE_THRESHOLD-3;
+                const int minBorderY = minBorderX;
+                const int maxBorderX = mvImagePyramid[level].cols-EDGE_THRESHOLD+3;
+                const int maxBorderY = mvImagePyramid[level].rows-EDGE_THRESHOLD+3;
+
+                vector<KeyPoint> & keypoints = allKeypoints[level];
+                keypoints = DistributeOctTree(candidates[level], minBorderX, maxBorderX,
+                                              minBorderY, maxBorderY,mnFeaturesPerLevel[level], level);
+
+                const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
+                const int nkps = keypoints.size();
+                for(int i=0; i<nkps ; i++)
+                {
+                    keypoints[i].pt.x+=minBorderX;
+                    keypoints[i].pt.y+=minBorderY;
+                    keypoints[i].octave=level;
+                    keypoints[i].size = scaledPatchSize;
+                }
+                computeOrientation(mvImagePyramid[level], keypoints, umax);
+            }
+        });
+#else
+        ComputeKeyPointsOctTree(allKeypoints);
+#endif
+    }
+
     static void computeDescriptors(const Mat& image, vector<KeyPoint>& keypoints, Mat& descriptors,
                                    const vector<Point>& pattern)
     {
@@ -1093,12 +1180,45 @@ namespace ORB_SLAM3
         Mat image = _image.getMat();
         assert(image.type() == CV_8UC1 );
 
-        // Pre-compute the scale pyramid
-        ComputePyramid(image);
-
         vector < vector<KeyPoint> > allKeypoints;
-        ComputeKeyPointsOctTree(allKeypoints);
-        //ComputeKeyPointsOld(allKeypoints);
+        vector<Mat> gpuDescriptors;
+        bool gpu = false;
+#ifdef ORB_SLAM3_WITH_CUDA
+        if (mpCuda)
+        {
+            try
+            {
+                // Pre-compute the scale pyramid
+                if (mbCudaCpuPyramid)
+                    ComputePyramid(image);
+                else
+                    mpCuda->BuildPyramid(image, mvInvScaleFactor, mvImagePyramid);
+                ComputeKeyPointsOctTreeCuda(allKeypoints);
+                vector<vector<float> > cosA(nlevels), sinA(nlevels);
+                for (int level = 0; level < nlevels; ++level)
+                    for (const KeyPoint& kpt : allKeypoints[level])
+                    {
+                        // as in computeOrbDescriptor
+                        float angle = (float)kpt.angle*factorPI;
+                        cosA[level].push_back((float)cos(angle));
+                        sinA[level].push_back((float)sin(angle));
+                    }
+                mpCuda->Describe(allKeypoints, cosA, sinA, gpuDescriptors);
+                gpu = true;
+            }
+            catch (const std::exception& e)
+            {
+                cerr << "[ORBextractor] CUDA error, falling back to the CPU: " << e.what() << endl;
+                mpCuda.reset();
+            }
+        }
+#endif
+        if (!gpu)
+        {
+            // Pre-compute the scale pyramid
+            ComputePyramid(image);
+            ComputeKeyPointsOctTree(allKeypoints);
+        }
 
         Mat descriptors;
 
@@ -1128,14 +1248,19 @@ namespace ORB_SLAM3
             if(nkeypointsLevel==0)
                 continue;
 
-            // preprocess the resized image
-            Mat workingMat = mvImagePyramid[level].clone();
-            GaussianBlur(workingMat, workingMat, Size(7, 7), 2, 2, BORDER_REFLECT_101);
+            Mat desc;
+            if (gpu)
+                desc = gpuDescriptors[level];
+            else
+            {
+                // preprocess the resized image
+                Mat workingMat = mvImagePyramid[level].clone();
+                GaussianBlur(workingMat, workingMat, Size(7, 7), 2, 2, BORDER_REFLECT_101);
 
-            // Compute the descriptors
-            //Mat desc = descriptors.rowRange(offset, offset + nkeypointsLevel);
-            Mat desc = cv::Mat(nkeypointsLevel, 32, CV_8U);
-            computeDescriptors(workingMat, keypoints, desc, pattern);
+                // Compute the descriptors
+                desc = cv::Mat(nkeypointsLevel, 32, CV_8U);
+                computeDescriptors(workingMat, keypoints, desc, pattern);
+            }
 
             offset += nkeypointsLevel;
 
