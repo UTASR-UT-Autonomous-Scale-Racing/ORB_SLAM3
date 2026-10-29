@@ -2276,8 +2276,9 @@ void Tracking::Track()
             // Check if we need to insert a new keyframe
             // if(bNeedKF && bOK)
             // (while lost, only with the IMU's predicted pose: before IMU initialisation a
-            // depth-inertial frame that failed to relocalise has none)
-            if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST && pCurrentMap->isImuInitialized() &&
+            // depth-inertial frame that failed to relocalise has none; and not from a frame
+            // without features)
+            if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST && pCurrentMap->isImuInitialized() && mCurrentFrame.N > 0 &&
                                    (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
                 CreateNewKeyFrame();
 
@@ -2999,7 +3000,9 @@ bool Tracking::TrackLocalMap()
         }
 
     int inliers;
-    if (!mpAtlas->isImuInitialized())
+    // depth-inertial, recovering from a loss: the last frame was not tracked, so the
+    // inertial optimisation against it has no visual anchor; optimise the pose visually
+    if (!mpAtlas->isImuInitialized() || (mState==RECENTLY_LOST && DepthInertialRecovery()))
         Optimizer::PoseOptimization(&mCurrentFrame);
     else
     {
@@ -3011,7 +3014,12 @@ bool Tracking::TrackLocalMap()
         else
         {
             // if(!mbMapUpdated && mState == OK) //  && (mnMatchesInliers>30))
-            if(!mbMapUpdated) //  && (mnMatchesInliers>30))
+            if(mCurrentFrame.N == 0 && DepthInertialRecovery())
+            {
+                // nothing to see (a featureless frame): keep the IMU prediction; an inertial
+                // optimisation without visual edges leaves a degenerate prior behind
+            }
+            else if(!mbMapUpdated) //  && (mnMatchesInliers>30))
             {
                 Verbose::PrintMess("TLM: PoseInertialOptimizationLastFrame ", Verbose::VERBOSITY_DEBUG);
                 inliers = Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());

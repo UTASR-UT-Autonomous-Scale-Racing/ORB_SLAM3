@@ -285,6 +285,10 @@ Eigen::Matrix3f Preintegrated::GetDeltaRotation(const Bias &b_)
     std::unique_lock<std::mutex> lock(mMutex);
     Eigen::Vector3f dbg;
     dbg << b_.bwx-b.bwx,b_.bwy-b.bwy,b_.bwz-b.bwz;
+    // a diverging optimisation step can hand in a non-finite bias; Sophus aborts the
+    // process on it. Use the preintegration's own bias: the caller checks its result
+    if (!dbg.allFinite())
+        return dR;
     return NormalizeRotation(dR * Sophus::SO3f::exp(JRg * dbg).matrix());
 }
 

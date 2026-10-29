@@ -5079,19 +5079,36 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     ear->setInformation(InfoA);
     optimizer.addEdge(ear);
 
+    // The previous frame has a prior only if it was itself optimised this way. A frame
+    // tracked otherwise (visual pose optimisation, e.g. recovering from a loss) has none:
+    // upstream dereferenced the null pointer here (segfault). Hold that frame's state fixed.
+    EdgePriorPoseImu* ep = nullptr;
+    if (pFp->mpcpi && !pFp->mpcpi->H.allFinite())
+    {
+        delete pFp->mpcpi;          // a degenerate prior (non-finite information) is no prior
+        pFp->mpcpi = NULL;
+    }
     if (!pFp->mpcpi)
-        Verbose::PrintMess("pFp->mpcpi does not exist!!!\nPrevious Frame " + to_string(pFp->mnId), Verbose::VERBOSITY_NORMAL);
+    {
+        Verbose::PrintMess("pFp->mpcpi does not exist, previous frame " + to_string(pFp->mnId) + " held fixed", Verbose::VERBOSITY_NORMAL);
+        VPk->setFixed(true);
+        VVk->setFixed(true);
+        VGk->setFixed(true);
+        VAk->setFixed(true);
+    }
+    else
+    {
+        ep = new EdgePriorPoseImu(pFp->mpcpi);
 
-    EdgePriorPoseImu* ep = new EdgePriorPoseImu(pFp->mpcpi);
-
-    ep->setVertex(0,VPk);
-    ep->setVertex(1,VVk);
-    ep->setVertex(2,VGk);
-    ep->setVertex(3,VAk);
-    g2o::RobustKernelHuber* rkp = new g2o::RobustKernelHuber;
-    ep->setRobustKernel(rkp);
-    rkp->setDelta(5);
-    optimizer.addEdge(ep);
+        ep->setVertex(0,VPk);
+        ep->setVertex(1,VVk);
+        ep->setVertex(2,VGk);
+        ep->setVertex(3,VAk);
+        g2o::RobustKernelHuber* rkp = new g2o::RobustKernelHuber;
+        ep->setRobustKernel(rkp);
+        rkp->setDelta(5);
+        optimizer.addEdge(ep);
+    }
 
     // We perform 4 optimizations, after each optimization we classify observation as inlier/outlier
     // At the next optimization, outliers are not included, but at the end they can be classified as inliers again.
@@ -5223,6 +5240,16 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     nInliers = nInliersMono + nInliersStereo;
 
 
+    // A diverged optimisation (non-finite state) must not reach the frame: keep its
+    // predicted state and give it no prior (the next frame then holds it fixed)
+    if (!VP->estimate().Rwb.allFinite() || !VP->estimate().twb.allFinite() || !VV->estimate().allFinite() ||
+        !VG->estimate().allFinite() || !VA->estimate().allFinite())
+    {
+        Verbose::PrintMess("PoseInertialOptimizationLastFrame diverged, frame " + to_string(pFrame->mnId) + " keeps its prediction", Verbose::VERBOSITY_NORMAL);
+        if (pFrame->mpcpi) { delete pFrame->mpcpi; pFrame->mpcpi = NULL; }
+        return 0;
+    }
+
     // Recover optimized pose, velocity and biases
     pFrame->SetImuPoseVelocity(VP->estimate().Rwb.cast<float>(), VP->estimate().twb.cast<float>(), VV->estimate().cast<float>());
     Vector6d b;
@@ -5247,7 +5274,8 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     H.block<3,3>(27,12) += Har.block<3,3>(3,0);
     H.block<3,3>(27,27) += Har.block<3,3>(3,3);
 
-    H.block<15,15>(0,0) += ep->GetHessian();
+    if (ep)
+        H.block<15,15>(0,0) += ep->GetHessian();
 
     int tot_in = 0, tot_out = 0;
     for(size_t i=0, iend=vpEdgesMono.size(); i<iend; i++)
@@ -5282,7 +5310,8 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
 
     H = Marginalize(H,0,14);
 
-    pFrame->mpcpi = new ConstraintPoseImu(VP->estimate().Rwb,VP->estimate().twb,VV->estimate(),VG->estimate(),VA->estimate(),H.block<15,15>(15,15));
+    pFrame->mpcpi = H.block<15,15>(15,15).allFinite() ?
+        new ConstraintPoseImu(VP->estimate().Rwb,VP->estimate().twb,VV->estimate(),VG->estimate(),VA->estimate(),H.block<15,15>(15,15)) : NULL;
     delete pFp->mpcpi;
     pFp->mpcpi = NULL;
 
