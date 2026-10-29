@@ -1184,7 +1184,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     }
     else
     {
-        minTime = 1.0;
+        minTime = mpTracker ? mpTracker->mImuInitTime : 1.0;
         nMinKF = 10;
     }
 
