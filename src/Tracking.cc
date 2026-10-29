@@ -604,6 +604,8 @@ void Tracking::newParameterLoader(Settings *settings) {
     Sophus::SE3f Tbc = settings->Tbc();
     mInsertKFsLost = settings->insertKFsWhenLost();
     mbUpstreamPolicy = settings->upstreamPolicy();
+    mImuInitTime = settings->imuInitTime();
+    mEarlyLostTimeout = settings->earlyLostTimeout();
     mImuFreq = settings->imuFrequency();
     mImuPer = 0.001; //1.0 / (double) mImuFreq;     //TODO: ESTO ESTA BIEN?
     float Ng = settings->noiseGyro();
@@ -1336,6 +1338,10 @@ bool Tracking::ParseIMUParamFile(cv::FileStorage &fSettings)
 
     node = fSettings["IMU.UpstreamPolicy"];
     mbUpstreamPolicy = !node.empty() && node.isInt() && node.operator int() != 0;
+    node = fSettings["IMU.InitTime"];
+    if(!node.empty() && node.isReal()) mImuInitTime = node.real();
+    node = fSettings["IMU.EarlyLostTimeout"];
+    if(!node.empty() && node.isReal()) mEarlyLostTimeout = node.real();
 
 
 
@@ -1800,6 +1806,14 @@ bool Tracking::DepthInertialRecovery() const
     return !mbUpstreamPolicy && (mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD);
 }
 
+bool Tracking::VisualOnlyTracking() const
+{
+    // upstream's inertial rules (wide search window, accept a pose from few matches) are
+    // for monocular-inertial, whose visual prediction is poor before the IMU is
+    // initialised; with depth it is as good as the visual mode's
+    return DepthInertialRecovery() && !mpAtlas->isImuInitialized();
+}
+
 void Tracking::Track()
 {
 
@@ -2001,7 +2015,12 @@ void Tracking::Track()
                         else
                             bOK = false;
 
-                        if (mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost)
+                        // depth-inertial while the map is young (before inertial BA 2): a lost
+                        // car has driven on, relocalisation rarely comes back, and the IMU
+                        // is not yet trusted to carry it: give the map up quickly
+                        const double timeout = (DepthInertialRecovery() && !pCurrentMap->GetIniertialBA2()) ?
+                                               mEarlyLostTimeout : time_recently_lost;
+                        if (mCurrentFrame.mTimeStamp-mTimeStampLost>timeout)
                         {
                             mState = LOST;
                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
@@ -2785,7 +2804,7 @@ bool Tracking::TrackReferenceKeyFrame()
         }
     }
 
-    if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+    if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !VisualOnlyTracking())
         return true;
     else
         return nmatchesMap>=10;
@@ -2912,7 +2931,7 @@ bool Tracking::TrackWithMotionModel()
     if(nmatches<20)
     {
         Verbose::PrintMess("Not enough matches!!", Verbose::VERBOSITY_NORMAL);
-        if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+        if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !VisualOnlyTracking())
             return true;
         else
             return false;
@@ -2953,7 +2972,7 @@ bool Tracking::TrackWithMotionModel()
         return nmatches>20;
     }
 
-    if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+    if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !VisualOnlyTracking())
         return true;
     else
         return nmatchesMap>=10;
@@ -3418,7 +3437,8 @@ void Tracking::SearchLocalPoints()
             else
                 th=6;
         }
-        else if(!mpAtlas->isImuInitialized() && (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor == System::IMU_RGBD))
+        else if(!mpAtlas->isImuInitialized() && (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor == System::IMU_RGBD) &&
+                !VisualOnlyTracking())
         {
             th=10;
         }

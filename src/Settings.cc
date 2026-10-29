@@ -433,6 +433,12 @@ namespace ORB_SLAM3 {
         // 1: IMU_STEREO / IMU_RGBD keep upstream ORB-SLAM3's tracking-loss and keyframe
         // policy; 0 (default): the depth-inertial one (Tracking::DepthInertialRecovery)
         upstreamPolicy_ = (bool) readParameter<int>(fSettings,"IMU.UpstreamPolicy",found,false);
+        // s of keyframes before the first IMU initialisation (stereo / RGB-D; upstream 1.0)
+        float v = readParameter<float>(fSettings,"IMU.InitTime",found,false);
+        if(found) imuInitTime_ = v;
+        // depth-inertial: s lost before inertial BA 2 after which the map is given up (upstream 5.0)
+        v = readParameter<float>(fSettings,"IMU.EarlyLostTimeout",found,false);
+        if(found) earlyLostTimeout_ = v;
     }
 
     void Settings::readRGBD(cv::FileStorage& fSettings) {
@@ -626,6 +632,7 @@ namespace ORB_SLAM3 {
             output << "\t-Accelerometer walk: " << settings.accWalk_ << endl;
             output << "\t-IMU frequency: " << settings.imuFrequency_ << endl;
             output << "\t-Upstream inertial loss/keyframe policy: " << settings.upstreamPolicy_ << endl;
+            output << "\t-IMU init time: " << settings.imuInitTime_ << " s, early lost timeout: " << settings.earlyLostTimeout_ << " s" << endl;
         }
 
         if(settings.sensor_ == System::RGBD || settings.sensor_ == System::IMU_RGBD){

@@ -170,6 +170,8 @@ public:
     double t0vis; // time-stamp of first inserted keyframe
     double t0IMU; // time-stamp of IMU initialization
     bool mFastInit = false;
+    float mImuInitTime = 1.0f;       // IMU.InitTime (stereo / RGB-D)
+    float mEarlyLostTimeout = 0.5f;  // IMU.EarlyLostTimeout (depth-inertial, before inertial BA 2)
 
 
     vector<MapPoint*> GetLocalMapMPS();
@@ -303,6 +305,8 @@ protected:
     // keyframe as in the visual modes. Off with IMU.UpstreamPolicy: 1.
     bool mbUpstreamPolicy = false;
     bool DepthInertialRecovery() const;
+    // depth-inertial before IMU initialisation: frame tracking as in the RGB-D / stereo mode
+    bool VisualOnlyTracking() const;
 
     //New KeyFrame rules (according to fps)
     int mMinFrames;
