@@ -297,6 +297,13 @@ protected:
     double mImuPer;
     bool mInsertKFsLost;
 
+    // IMU_STEREO / IMU_RGBD: depth fixes the map's scale, so a tracking loss before the IMU
+    // is initialised (or before inertial BA 2) is recovered visually (relocalisation, then
+    // a new map) instead of resetting the active map, and weak visual tracking asks for a
+    // keyframe as in the visual modes. Off with IMU.UpstreamPolicy: 1.
+    bool mbUpstreamPolicy = false;
+    bool DepthInertialRecovery() const;
+
     //New KeyFrame rules (according to fps)
     int mMinFrames;
     int mMaxFrames;

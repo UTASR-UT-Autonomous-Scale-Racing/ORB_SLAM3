@@ -429,6 +429,10 @@ namespace ORB_SLAM3 {
         else{
             insertKFsWhenLost_ = true;
         }
+
+        // 1: IMU_STEREO / IMU_RGBD keep upstream ORB-SLAM3's tracking-loss and keyframe
+        // policy; 0 (default): the depth-inertial one (Tracking::DepthInertialRecovery)
+        upstreamPolicy_ = (bool) readParameter<int>(fSettings,"IMU.UpstreamPolicy",found,false);
     }
 
     void Settings::readRGBD(cv::FileStorage& fSettings) {
@@ -621,6 +625,7 @@ namespace ORB_SLAM3 {
             output << "\t-Gyro walk: " << settings.gyroWalk_ << endl;
             output << "\t-Accelerometer walk: " << settings.accWalk_ << endl;
             output << "\t-IMU frequency: " << settings.imuFrequency_ << endl;
+            output << "\t-Upstream inertial loss/keyframe policy: " << settings.upstreamPolicy_ << endl;
         }
 
         if(settings.sensor_ == System::RGBD || settings.sensor_ == System::IMU_RGBD){
