@@ -171,7 +171,7 @@ public:
     double t0IMU; // time-stamp of IMU initialization
     bool mFastInit = false;
     float mImuInitTime = 1.0f;       // IMU.InitTime (stereo / RGB-D)
-    float mEarlyLostTimeout = 0.5f;  // IMU.EarlyLostTimeout (depth-inertial, before inertial BA 2)
+    float mEarlyLostTimeout = 1.0f;  // IMU.EarlyLostTimeout (depth-inertial, before inertial BA 2)
 
 
     vector<MapPoint*> GetLocalMapMPS();

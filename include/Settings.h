@@ -197,7 +197,7 @@ namespace ORB_SLAM3 {
         bool insertKFsWhenLost_;
         bool upstreamPolicy_ = false;
         float imuInitTime_ = 1.0f;
-        float earlyLostTimeout_ = 0.5f;
+        float earlyLostTimeout_ = 1.0f;
 
         /*
          * RGBD stuff
