@@ -243,6 +243,12 @@ protected:
     std::vector<IMU::Point> mvImuFromLastFrame;
     std::mutex mMutexImuQueue;
 
+    // Guards mCurrentFrame / mLastFrame between the tracking thread (building the frame and
+    // preintegrating its IMU, before it takes the map's mMutexMapUpdate) and UpdateFrameIMU,
+    // which local mapping and loop closing call (holding mMutexMapUpdate). Lock order: map
+    // update, then frames; the tracking thread never holds frames while waiting for the map.
+    std::mutex mMutexFrames;
+
     // Imu calibration parameters
     IMU::Calib *mpImuCalib;
 
@@ -307,6 +313,11 @@ protected:
     bool DepthInertialRecovery() const;
     // depth-inertial before IMU initialisation: frame tracking as in the RGB-D / stereo mode
     bool VisualOnlyTracking() const;
+    // depth-inertial: frame id at which tracking came back from RECENTLY_LOST; for
+    // mnFramesToResetIMU frames after it frames are tracked visually (as upstream does after
+    // a relocalisation) while local inertial BA makes the IMU state consistent again
+    unsigned long mnRecoveredFrameId = 0;
+    bool RecentlyRecovered() const;
 
     //New KeyFrame rules (according to fps)
     int mMinFrames;
