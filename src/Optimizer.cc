@@ -5081,7 +5081,9 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
 
     // The previous frame has a prior only if it was itself optimised this way. A frame
     // tracked otherwise (visual pose optimisation, e.g. recovering from a loss) has none:
-    // upstream dereferenced the null pointer here (segfault). Hold that frame's state fixed.
+    // upstream dereferenced the null pointer here (segfault). Tracking::TrackLocalMap now
+    // optimises against the last keyframe in that case; if this is reached anyway, the
+    // previous frame's state is held fixed.
     EdgePriorPoseImu* ep = nullptr;
     if (pFp->mpcpi && !pFp->mpcpi->H.allFinite())
     {
@@ -5245,7 +5247,7 @@ int Optimizer::PoseInertialOptimizationLastFrame(Frame *pFrame, bool bRecInit)
     if (!VP->estimate().Rwb.allFinite() || !VP->estimate().twb.allFinite() || !VV->estimate().allFinite() ||
         !VG->estimate().allFinite() || !VA->estimate().allFinite())
     {
-        Verbose::PrintMess("PoseInertialOptimizationLastFrame diverged, frame " + to_string(pFrame->mnId) + " keeps its prediction", Verbose::VERBOSITY_NORMAL);
+        Verbose::PrintMess("PoseInertialOptimizationLastFrame diverged, frame " + to_string(pFrame->mnId) + " keeps its prediction", Verbose::VERBOSITY_QUIET);
         if (pFrame->mpcpi) { delete pFrame->mpcpi; pFrame->mpcpi = NULL; }
         return 0;
     }
