@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Part of ORB-SLAM3 (GPLv3, see LICENSE). Copyright (C) 2026 UTASR - UT Autonomous Scale Racing.
 # ORB-SLAM3 with the CPU and the CUDA paths: EuRoC V1_01..03 stereo x3 and
 # monocular x2, TUM RGB-D fr1_xyz / fr1_desk x3. Prints median tracking time and ATE.
 #   Examples/Benchmarks/slam_cpu_vs_cuda.sh <data_dir> [out_dir]
