@@ -603,6 +603,9 @@ void Tracking::newParameterLoader(Settings *settings) {
     //IMU parameters
     Sophus::SE3f Tbc = settings->Tbc();
     mInsertKFsLost = settings->insertKFsWhenLost();
+    mbUpstreamPolicy = settings->upstreamPolicy();
+    mImuInitTime = settings->imuInitTime();
+    mEarlyLostTimeout = settings->earlyLostTimeout();
     mImuFreq = settings->imuFrequency();
     mImuPer = 0.001; //1.0 / (double) mImuFreq;     //TODO: ESTO ESTA BIEN?
     float Ng = settings->noiseGyro();
@@ -1333,6 +1336,13 @@ bool Tracking::ParseIMUParamFile(cv::FileStorage &fSettings)
     if(!mInsertKFsLost)
         cout << "Do not insert keyframes when lost visual tracking " << endl;
 
+    node = fSettings["IMU.UpstreamPolicy"];
+    mbUpstreamPolicy = !node.empty() && node.isInt() && node.operator int() != 0;
+    node = fSettings["IMU.InitTime"];
+    if(!node.empty() && node.isReal()) mImuInitTime = node.real();
+    node = fSettings["IMU.EarlyLostTimeout"];
+    if(!node.empty() && node.isReal()) mEarlyLostTimeout = node.real();
+
 
 
     float Ng, Na, Ngw, Naw;
@@ -1490,6 +1500,8 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
 
     //cout << "Incoming frame creation" << endl;
 
+    {
+    unique_lock<mutex> lockFrames(mMutexFrames);
     if (mSensor == System::STEREO && !mpCamera2)
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera);
     else if(mSensor == System::STEREO && mpCamera2)
@@ -1498,6 +1510,7 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera,&mLastFrame,*mpImuCalib);
     else if(mSensor == System::IMU_STEREO && mpCamera2)
         mCurrentFrame = Frame(mImGray,imGrayRight,timestamp,mpORBextractorLeft,mpORBextractorRight,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera,mpCamera2,mTlr,&mLastFrame,*mpImuCalib);
+    }
 
     //cout << "Incoming frame ended" << endl;
 
@@ -1540,10 +1553,13 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
     if((fabs(mDepthMapFactor-1.0f)>1e-5) || imDepth.type()!=CV_32F)
         imDepth.convertTo(imDepth,CV_32F,mDepthMapFactor);
 
+    {
+    unique_lock<mutex> lockFrames(mMutexFrames);
     if (mSensor == System::RGBD)
         mCurrentFrame = Frame(mImGray,imDepth,timestamp,mpORBextractorLeft,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera);
     else if(mSensor == System::IMU_RGBD)
         mCurrentFrame = Frame(mImGray,imDepth,timestamp,mpORBextractorLeft,mpORBVocabulary,mK,mDistCoef,mbf,mThDepth,mpCamera,&mLastFrame,*mpImuCalib);
+    }
 
 
 
@@ -1581,6 +1597,7 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
             cvtColor(mImGray,mImGray,cv::COLOR_BGRA2GRAY);
     }
 
+    unique_lock<mutex> lockFrames(mMutexFrames);
     if (mSensor == System::MONOCULAR)
     {
         if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
@@ -1597,6 +1614,7 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
         else
             mCurrentFrame = Frame(mImGray,timestamp,mpORBextractorLeft,mpORBVocabulary,mpCamera,mDistCoef,mbf,mThDepth,&mLastFrame,*mpImuCalib);
     }
+    lockFrames.unlock();
 
     if (mState==NO_IMAGES_YET)
         t0=timestamp;
@@ -1791,6 +1809,25 @@ void Tracking::ResetFrameIMU()
 }
 
 
+bool Tracking::DepthInertialRecovery() const
+{
+    return !mbUpstreamPolicy && (mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD);
+}
+
+bool Tracking::VisualOnlyTracking() const
+{
+    // upstream's inertial rules (wide search window, accept a pose from few matches) are
+    // for monocular-inertial, whose visual prediction is poor before the IMU is
+    // initialised; with depth it is as good as the visual mode's
+    return DepthInertialRecovery() && (!mpAtlas->isImuInitialized() || RecentlyRecovered());
+}
+
+bool Tracking::RecentlyRecovered() const
+{
+    return DepthInertialRecovery() && mnRecoveredFrameId > 0 &&
+           mCurrentFrame.mnId <= mnRecoveredFrameId + mnFramesToResetIMU;
+}
+
 void Tracking::Track()
 {
 
@@ -1856,6 +1893,8 @@ void Tracking::Track()
     }
 
 
+    unique_lock<mutex> lockFrames(mMutexFrames);
+
     if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && mpLastKeyFrame)
         mCurrentFrame.SetNewBias(mpLastKeyFrame->GetImuBias());
 
@@ -1881,6 +1920,7 @@ void Tracking::Track()
 
     }
     mbCreatedMap = false;
+    lockFrames.unlock();     // never held while waiting for the map (lock order: map, then frames)
 
     // Get Map Mutex -> Map cannot be changed
     unique_lock<mutex> lock(pCurrentMap->mMutexMapUpdate);
@@ -1987,10 +2027,17 @@ void Tracking::Track()
                     {
                         if(pCurrentMap->isImuInitialized())
                             PredictStateIMU();
+                        else if(DepthInertialRecovery())
+                            bOK = Relocalization();     // the IMU can't carry tracking yet: visual
                         else
                             bOK = false;
 
-                        if (mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost)
+                        // depth-inertial while the map is young (before inertial BA 2): a lost
+                        // car has driven on, relocalisation rarely comes back, and the IMU
+                        // is not yet trusted to carry it: give the map up quickly
+                        const double timeout = (DepthInertialRecovery() && !pCurrentMap->GetIniertialBA2()) ?
+                                               mEarlyLostTimeout : time_recently_lost;
+                        if (mCurrentFrame.mTimeStamp-mTimeStampLost>timeout)
                         {
                             mState = LOST;
                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
@@ -2140,13 +2187,17 @@ void Tracking::Track()
         }
 
         if(bOK)
+        {
+            if(mState == RECENTLY_LOST && DepthInertialRecovery() && pCurrentMap->isImuInitialized())
+                mnRecoveredFrameId = mCurrentFrame.mnId;
             mState = OK;
+        }
         else if (mState == OK)
         {
             if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
             {
                 Verbose::PrintMess("Track lost for less than one second...", Verbose::VERBOSITY_NORMAL);
-                if(!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2())
+                if((!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2()) && !DepthInertialRecovery())
                 {
                     cout << "IMU is not or recently initialized. Reseting active map..." << endl;
                     mpSystem->ResetActiveMap();
@@ -2245,7 +2296,10 @@ void Tracking::Track()
 
             // Check if we need to insert a new keyframe
             // if(bNeedKF && bOK)
-            if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST &&
+            // (while lost, only with the IMU's predicted pose: before IMU initialisation a
+            // depth-inertial frame that failed to relocalise has none; and not from a frame
+            // without features)
+            if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST && pCurrentMap->isImuInitialized() && mCurrentFrame.N > 0 &&
                                    (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
                 CreateNewKeyFrame();
 
@@ -2276,7 +2330,7 @@ void Tracking::Track()
                 return;
             }
             if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
-                if (!pCurrentMap->isImuInitialized())
+                if (!pCurrentMap->isImuInitialized() && !DepthInertialRecovery())
                 {
                     Verbose::PrintMess("Track lost before IMU initialisation, reseting...", Verbose::VERBOSITY_QUIET);
                     mpSystem->ResetActiveMap();
@@ -2692,8 +2746,11 @@ void Tracking::CreateMapInAtlas()
     if(mpReferenceKF)
         mpReferenceKF = static_cast<KeyFrame*>(NULL);
 
-    mLastFrame = Frame();
-    mCurrentFrame = Frame();
+    {
+        unique_lock<mutex> lockFrames(mMutexFrames);
+        mLastFrame = Frame();
+        mCurrentFrame = Frame();
+    }
     mvIniMatches.clear();
 
     mbCreatedMap = true;
@@ -2772,7 +2829,7 @@ bool Tracking::TrackReferenceKeyFrame()
         }
     }
 
-    if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+    if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !VisualOnlyTracking())
         return true;
     else
         return nmatchesMap>=10;
@@ -2859,7 +2916,7 @@ bool Tracking::TrackWithMotionModel()
     // Create "visual odometry" points if in Localization Mode
     UpdateLastFrame();
 
-    if (mpAtlas->isImuInitialized() && (mCurrentFrame.mnId>mnLastRelocFrameId+mnFramesToResetIMU))
+    if (mpAtlas->isImuInitialized() && (mCurrentFrame.mnId>mnLastRelocFrameId+mnFramesToResetIMU) && !RecentlyRecovered())
     {
         // Predict state with IMU if it is initialized and it doesnt need reset
         PredictStateIMU();
@@ -2899,7 +2956,7 @@ bool Tracking::TrackWithMotionModel()
     if(nmatches<20)
     {
         Verbose::PrintMess("Not enough matches!!", Verbose::VERBOSITY_NORMAL);
-        if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+        if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !VisualOnlyTracking())
             return true;
         else
             return false;
@@ -2940,7 +2997,7 @@ bool Tracking::TrackWithMotionModel()
         return nmatches>20;
     }
 
-    if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+    if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !VisualOnlyTracking())
         return true;
     else
         return nmatchesMap>=10;
@@ -2967,11 +3024,13 @@ bool Tracking::TrackLocalMap()
         }
 
     int inliers;
-    if (!mpAtlas->isImuInitialized())
+    // depth-inertial, recovering from a loss: the last frame was not tracked, so the
+    // inertial optimisation against it has no visual anchor; optimise the pose visually
+    if (!mpAtlas->isImuInitialized() || (mState==RECENTLY_LOST && DepthInertialRecovery()))
         Optimizer::PoseOptimization(&mCurrentFrame);
     else
     {
-        if(mCurrentFrame.mnId<=mnLastRelocFrameId+mnFramesToResetIMU)
+        if(mCurrentFrame.mnId<=mnLastRelocFrameId+mnFramesToResetIMU || RecentlyRecovered())
         {
             Verbose::PrintMess("TLM: PoseOptimization ", Verbose::VERBOSITY_DEBUG);
             Optimizer::PoseOptimization(&mCurrentFrame);
@@ -2979,7 +3038,17 @@ bool Tracking::TrackLocalMap()
         else
         {
             // if(!mbMapUpdated && mState == OK) //  && (mnMatchesInliers>30))
-            if(!mbMapUpdated) //  && (mnMatchesInliers>30))
+            if(mCurrentFrame.N == 0 && DepthInertialRecovery())
+            {
+                // nothing to see (a featureless frame): keep the IMU prediction; an inertial
+                // optimisation without visual edges leaves a degenerate prior behind
+            }
+            // ... and only against a last frame that has an inertial prior (it was optimised
+            // this way): a frame tracked otherwise, e.g. the one that recovered from a loss,
+            // carries a visually corrected pose with the velocity of the IMU prediction, and
+            // optimising against it diverged; the last keyframe's state is consistent (local
+            // inertial BA)
+            else if(!mbMapUpdated && (mLastFrame.mpcpi || !DepthInertialRecovery())) //  && (mnMatchesInliers>30))
             {
                 Verbose::PrintMess("TLM: PoseInertialOptimizationLastFrame ", Verbose::VERBOSITY_DEBUG);
                 inliers = Optimizer::PoseInertialOptimizationLastFrame(&mCurrentFrame); // , !mpLastKeyFrame->GetMap()->GetIniertialBA1());
@@ -3069,9 +3138,16 @@ bool Tracking::NeedNewKeyFrame()
             return true;
         else if ((mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && (mCurrentFrame.mTimeStamp-mpLastKeyFrame->mTimeStamp)>=0.25)
             return true;
-        else
+        else if (!DepthInertialRecovery())
             return false;
+        // else fall through to the visual rules: at speed, 0.25 s between keyframes leaves
+        // the local map behind before the IMU can carry tracking
     }
+    // weak visual tracking asks for a keyframe (c1c below) in the visual modes and, with
+    // depth, the inertial ones: upstream leaves it to the IMU, which at car speeds leaves
+    // the local map behind within a few frames
+    const bool bVisualRules = !(mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) ||
+                              DepthInertialRecovery();
 
     if(mbOnlyTracking)
         return false;
@@ -3157,7 +3233,7 @@ bool Tracking::NeedNewKeyFrame()
     // Condition 1b: More than "MinFrames" have passed and Local Mapping is idle
     const bool c1b = ((mCurrentFrame.mnId>=mnLastKeyFrameId+mMinFrames) && bLocalMappingIdle); //mpLocalMapper->KeyframesInQueue() < 2);
     //Condition 1c: tracking is weak
-    const bool c1c = mSensor!=System::MONOCULAR && mSensor!=System::IMU_MONOCULAR && mSensor!=System::IMU_STEREO && mSensor!=System::IMU_RGBD && (mnMatchesInliers<nRefMatches*0.25 || bNeedToInsertClose) ;
+    const bool c1c = mSensor!=System::MONOCULAR && mSensor!=System::IMU_MONOCULAR && bVisualRules && (mnMatchesInliers<nRefMatches*0.25 || bNeedToInsertClose) ;
     // Condition 2: Few tracked points compared to reference keyframe. Lots of visual odometry compared to map matches.
     const bool c2 = (((mnMatchesInliers<nRefMatches*thRefRatio || bNeedToInsertClose)) && mnMatchesInliers>15);
 
@@ -3398,7 +3474,8 @@ void Tracking::SearchLocalPoints()
             else
                 th=6;
         }
-        else if(!mpAtlas->isImuInitialized() && (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor == System::IMU_RGBD))
+        else if(!mpAtlas->isImuInitialized() && (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor == System::IMU_RGBD) &&
+                !VisualOnlyTracking())
         {
             th=10;
         }
@@ -3824,9 +3901,12 @@ void Tracking::Reset(bool bLocMap)
     mlpReferences.clear();
     mlFrameTimes.clear();
     mlbLost.clear();
-    mCurrentFrame = Frame();
+    {
+        unique_lock<mutex> lockFrames(mMutexFrames);
+        mCurrentFrame = Frame();
+        mLastFrame = Frame();
+    }
     mnLastRelocFrameId = 0;
-    mLastFrame = Frame();
     mpReferenceKF = static_cast<KeyFrame*>(NULL);
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
@@ -3914,8 +3994,11 @@ void Tracking::ResetActiveMap(bool bLocMap)
     mnInitialFrameId = mCurrentFrame.mnId;
     mnLastRelocFrameId = mCurrentFrame.mnId;
 
-    mCurrentFrame = Frame();
-    mLastFrame = Frame();
+    {
+        unique_lock<mutex> lockFrames(mMutexFrames);
+        mCurrentFrame = Frame();
+        mLastFrame = Frame();
+    }
     mpReferenceKF = static_cast<KeyFrame*>(NULL);
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
@@ -4005,16 +4088,19 @@ void Tracking::UpdateFrameIMU(const float s, const IMU::Bias &b, KeyFrame* pCurr
 
     mpLastKeyFrame = pCurrentKeyFrame;
 
+    // the tracking thread builds and preintegrates mCurrentFrame under this lock, so the
+    // frame seen here is whole (it may not be preintegrated: a frame after a new map, or
+    // one not yet integrated; then only mLastFrame is updated). Upstream busy-waited for
+    // the preintegration without a lock and wrote the frames while tracking rebuilt them.
+    unique_lock<mutex> lockFrames(mMutexFrames);
+
     mLastFrame.SetNewBias(mLastBias);
     mCurrentFrame.SetNewBias(mLastBias);
 
-    while(!mCurrentFrame.imuIsPreintegrated())
-    {
-        usleep(500);
-    }
 
-
-    if(mLastFrame.mnId == mLastFrame.mpLastKeyFrame->mnFrameId)
+    if(!mLastFrame.mpLastKeyFrame || !mLastFrame.mpImuPreintegrated)
+        ;   // nothing to propagate from (the last frame started a map)
+    else if(mLastFrame.mnId == mLastFrame.mpLastKeyFrame->mnFrameId)
     {
         mLastFrame.SetImuPoseVelocity(mLastFrame.mpLastKeyFrame->GetImuRotation(),
                                       mLastFrame.mpLastKeyFrame->GetImuPosition(),
@@ -4033,7 +4119,7 @@ void Tracking::UpdateFrameIMU(const float s, const IMU::Bias &b, KeyFrame* pCurr
                                       Vwb1 + Gz*t12 + Rwb1*mLastFrame.mpImuPreintegrated->GetUpdatedDeltaVelocity());
     }
 
-    if (mCurrentFrame.mpImuPreintegrated)
+    if (mCurrentFrame.mpImuPreintegrated && mCurrentFrame.imuIsPreintegrated() && mCurrentFrame.mpLastKeyFrame)
     {
         const Eigen::Vector3f Gz(0, 0, -IMU::GRAVITY_VALUE);
 

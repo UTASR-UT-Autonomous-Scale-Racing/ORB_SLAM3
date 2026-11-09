@@ -1184,7 +1184,7 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     }
     else
     {
-        minTime = 1.0;
+        minTime = mpTracker ? mpTracker->mImuInitTime : 1.0;
         nMinKF = 10;
     }
 
@@ -1292,7 +1292,12 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
             }
     }
 
-    mpTracker->UpdateFrameIMU(1.0,vpKF[0]->GetImuBias(),mpCurrentKeyFrame);
+    {
+        // upstream called this without the map lock, racing the tracking thread's use of
+        // its frames (it held the lock for the call above)
+        unique_lock<mutex> lock(mpAtlas->GetCurrentMap()->mMutexMapUpdate);
+        mpTracker->UpdateFrameIMU(1.0,vpKF[0]->GetImuBias(),mpCurrentKeyFrame);
+    }
     if (!mpAtlas->isImuInitialized())
     {
         mpAtlas->SetImuInitialized();
